@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Viridis — Architecture &amp; Design Guide</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="doc">
+    <div class="kicker">Viridis · Bybit Execution Engine</div>
+    <h1>Architecture &amp; design guide</h1>
+    <p>A risk-first execution terminal for Bybit V5 USDT perpetuals. You define the risk; the engine derives the size, the leverage, and the bracket.</p>
+  </header>
+
+  <div class="toc">
+    <a href="#philosophy"><span class="n">01</span> &nbsp;Philosophy</a>
+    <a href="#architecture"><span class="n">02</span> &nbsp;Architecture &amp; signal flow</a>
+    <a href="#math"><span class="n">03</span> &nbsp;The risk math</a>
+    <a href="#execution"><span class="n">04</span> &nbsp;Order execution</a>
+    <a href="#threading"><span class="n">05</span> &nbsp;Concurrency model</a>
+    <a href="#lifecycle"><span class="n">06</span> &nbsp;Trade lifecycle</a>
+    <a href="#strat1"><span class="n">07</span> &nbsp;Strat1 trailing</a>
+    <a href="#journal"><span class="n">08</span> &nbsp;Journal sync</a>
+    <a href="#config"><span class="n">09</span> &nbsp;Config &amp; data files</a>
+  </div>
+
+  <!-- ════════════════════════ 01 ════════════════════════ -->
+  <h2 id="philosophy">01 · Philosophy — risk-first sizing</h2>
+  <p>Most order tickets ask "how much size / what leverage?" Viridis inverts that. You state the
+  one thing you actually know — <strong>how many dollars you're willing to lose</strong> — plus your
+  entry and stop. Everything else is <em>derived</em>:</p>
+  <div class="eqn">
+    <span class="lbl">The whole idea</span>
+    risk ($) + entry + stop&nbsp;&nbsp;⟶&nbsp;&nbsp;position size, leverage, and a full OTOCO bracket
+  </div>
+  <ul>
+    <li><strong>Position size</strong> comes from risk, never from margin or a leverage slider.</li>
+    <li><strong>Leverage</strong> is computed so liquidation always sits <em>behind</em> your stop — it is a capital-efficiency knob, not a risk knob.</li>
+    <li><strong>"Risk" means net loss</strong> — the size is solved so that the price move to your stop <em>plus round-trip fees</em> equals the dollars you typed.</li>
+  </ul>
+  <p>The result: if you're wrong you lose exactly what you said; if you're right you keep the rest.
+  Leverage changing from 20× to 50× does not change either number — only how much margin is locked.</p>
+
+  <!-- ════════════════════════ 02 ════════════════════════ -->
+  <h2 id="architecture">02 · Architecture &amp; signal flow</h2>
+  <p>Six modules, sharply separated. All exchange I/O is non-blocking; all GUI updates travel through Qt signals.</p>
+  <div class="grid">
+    <div class="mod"><div class="fn">config.py</div><div class="ds">.env → typed constants: API keys, fee rates, SL trigger reference, cache &amp; journal settings.</div></div>
+    <div class="mod"><div class="fn">cache_engine.py</div><div class="ds">Instrument symbology + per-symbol maintenance-margin rate. Paginated pull, cached to disk (24h TTL), O(1) lookup.</div></div>
+    <div class="mod"><div class="fn">trading_core.py</div><div class="ds">The engine: risk math, OTOCO execution, REST + dual WebSocket state machine, Strat1, journal reconciliation. No GUI.</div></div>
+    <div class="mod"><div class="fn">journal.py</div><div class="ds">Append-only trade journal, deduped by closing order ID, mirrored from Bybit's closed-PnL. Stats + R-multiples.</div></div>
+    <div class="mod"><div class="fn">main.py</div><div class="ds">PyQt6 terminal GUI. Owns the SignalBridge, renders trade cards, preview, journal, logs.</div></div>
+    <div class="mod"><div class="fn">test_trade.py</div><div class="ds">CLI dry-run harness: prints the exact payload, leverage, margin, and fee estimate before optionally firing.</div></div>
+  </div>
+
+  <p>The rule that keeps the GUI responsive: <strong>background threads never touch widgets directly.</strong>
+  They mutate state under a lock, then hand an immutable snapshot to the main thread via a Qt signal.</p>
+  <div class="flow">
+    <div class="node process"><b>TradingCore</b> &nbsp;— REST + WebSocket threads<br><span class="muted">mutate TradeState under an RLock, emit a clone()</span></div>
+    <div class="arrow">↓ &nbsp; pyqtSignal (thread-safe, queued to main thread)</div>
+    <div class="node decision"><b>SignalBridge</b> &nbsp;— QObject signal hub</div>
+    <div class="arrow">↓</div>
+    <div class="node process"><b>MainWindow</b> &nbsp;— main/UI thread only<br><span class="muted">renders cards, preview, journal, logs</span></div>
+  </div>
+
+  <!-- ════════════════════════ 03 ════════════════════════ -->
+  <h2 id="math">03 · The risk math</h2>
+
+  <h3>Position size (fee-aware)</h3>
+  <p>When a long is stopped out you lose the price move <em>and</em> pay fees on the notional — a maker
+  fee on the limit entry and a taker fee on the market stop. Both scale with notional, which balloons
+  as the stop tightens. So the size is solved with the fees inside the denominator:</p>
+  <div class="eqn">
+    <span class="lbl">Fee-aware quantity</span>
+    qty = risk &nbsp;/&nbsp; ( |entry − sl| &nbsp;+&nbsp; entry·f<sub>maker</sub> &nbsp;+&nbsp; sl·f<sub>taker</sub> )
+  </div>
+  <pre><span class="c"># Worked example — BTC long, entry 74,300 · SL 73,300 · risk $50</span>
+fee/unit  = 74300·0.0002 + 73300·0.00055   = 55.18
+qty       = 50 / (1000 + 55.18)            = 0.04738  <span class="c">→ 0.047 (round down to step)</span>
+
+<span class="c"># Naive sizing (risk/|entry−sl|) would give 0.050 and a TRUE loss of $52.76 — a 5.5%</span>
+<span class="c"># overshoot here, ballooning to ~37% on a 0.2% stop. Fee-aware holds the loss at $50.</span></pre>
+
+  <h3>Safe leverage</h3>
+  <p>Leverage is chosen so the liquidation distance always exceeds the stop distance, with a cushion for
+  the stop order's own fill slippage. The exact isolated-margin liquidation distance for a long is:</p>
+  <div class="eqn">
+    <span class="lbl">Liquidation distance (fraction of entry)</span>
+    liq_dist = ( 1/L − MMR ) / ( 1 − MMR )
+  </div>
+  <p>The engine uses the slightly conservative approximation <code>1/L − MMR</code> (dropping the
+  <code>1−MMR</code> denominator makes it under-estimate the distance — i.e. it errs toward <em>safer</em>,
+  lower leverage), and requires it to clear the stop plus a buffer:</p>
+  <div class="eqn">
+    <span class="lbl">Chosen leverage</span>
+    L = floor( 1 / ( sl_distance + MMR + fee_cushion ) ) &nbsp;&nbsp;<span style="color:var(--dim)">capped at the symbol's max</span>
+  </div>
+  <pre><span class="c"># BTC: sl_distance = 1000/74300 = 1.346% · MMR = 0.5% · cushion = 0.2%</span>
+L = floor( 1 / (0.01346 + 0.005 + 0.002) ) = floor(48.9) = <span class="g">48×</span></pre>
+  <div class="callout info">
+    <h3>Why a Mark-Price stop trigger?</h3>
+    <p>Liquidation is <em>always</em> evaluated on <strong>Mark Price</strong>. If your stop triggered on
+    Last Price, your cushion would be measured between two different rulers — and Last vs Mark diverge
+    exactly during the violent moves where the cushion matters. Triggering the SL on Mark puts it on the
+    same ruler as the liquidation engine, so the stop is <em>guaranteed</em> to fire first. The leverage
+    cushion above is then simply the room for the market stop to fill. Configurable via <code>SL_TRIGGER_BY</code>.</p>
+  </div>
+
+  <!-- ════════════════════════ 04 ════════════════════════ -->
+  <h2 id="execution">04 · Order execution — the atomic bracket</h2>
+  <p>A single <code>place_order</code> call carries the entry plus its dormant TP/SL, so the entry and its
+  bracket arrive together (OTOCO). With <code>tpslMode="Partial"</code> the TP is a real limit order
+  (maker fee), the SL is a market order (guaranteed exit), and multi-target scale-outs stay possible later.</p>
+  <pre>{
+  orderType:   <span class="a">"Limit"</span>,   price: entry,   qty: <span class="c">&lt;fee-aware&gt;</span>,
+  takeProfit:  <span class="c">&lt;midpoint trigger&gt;</span>,  tpOrderType: <span class="a">"Limit"</span>,  tpLimitPrice: tp,
+  stopLoss:    sl,           slOrderType: <span class="a">"Market"</span>,  slTriggerBy: <span class="y">"MarkPrice"</span>,
+  tpslMode:    <span class="a">"Partial"</span>,   timeInForce: <span class="a">"GTC"</span> <span class="c">(or "PostOnly" — cancel instead of crossing the book)</span>
+}</pre>
+  <p>The GUI shows the symbol's <strong>live last/bid/ask</strong> while you type (click to use as entry) and
+  warns when a limit entry would cross the book — a marketable limit fills <em>immediately as taker</em>, at
+  a different price and fee than the sizing assumed. The optional <code>post-only</code> checkbox turns that
+  warning into an exchange-side guarantee. After the fill, the private execution stream verifies the
+  assumption: a taker entry is flagged in the log with actual vs planned fees. A live position can always be
+  exited instantly via <strong>close mkt</strong> (reduce-only market order + a sweep that cancels any
+  orphaned TP/SL conditionals).</p>
+
+  <h3>The midpoint-trigger trick (for a maker TP fill)</h3>
+  <p>The TP <em>trigger</em> is set at the midpoint between entry and target, while the limit <em>price</em>
+  sits at the target. So when price reaches the midpoint, a limit order is placed at the target and rests
+  on the book — by the time price arrives, it fills as a <strong>maker</strong>, not a taker.</p>
+  <div class="axis">
+    <div class="axisbar">
+      <div class="mark" style="left:8%;">SL<span class="v">market exit</span></div>
+      <div class="mark" style="left:42%;">entry<span class="v">limit fill</span></div>
+      <div class="mark" style="left:66%;">midpoint<span class="v">TP trigger fires → limit rests</span></div>
+      <div class="mark" style="left:92%;">TP<span class="v">maker fill</span></div>
+    </div>
+    <span class="muted">Long shown. The limit sell is placed at the target the moment price crosses the midpoint, so it's resting (maker) before price gets there.</span>
+  </div>
+
+  <!-- ════════════════════════ 05 ════════════════════════ -->
+  <h2 id="threading">05 · Concurrency model</h2>
+  <p>This is the most intricate part of the system: four execution contexts cooperate, and exactly one of
+  them is allowed to touch the GUI. Understanding the lanes is the key to understanding the code.</p>
+  <div class="lanes">
+    <div class="lane qt">
+      <div class="h">① Qt main thread</div>
+      <ul>
+        <li>All widget rendering &amp; reads</li>
+        <li>30s position-sync timer</li>
+        <li>500ms panel-flush timer</li>
+        <li>Spawns workers for execute / modify / cancel so it never blocks</li>
+      </ul>
+    </div>
+    <div class="lane priv">
+      <div class="h">② Private WS</div>
+      <ul>
+        <li>order_stream → fills, cancels, TP/SL hits</li>
+        <li>position_stream → uPnL, mark, realised PnL</li>
+        <li>execution_stream → per-fill fees, maker/taker truth</li>
+        <li>wallet_stream → live equity</li>
+        <li>Mutates TradeState under the lock</li>
+      </ul>
+    </div>
+    <div class="lane pub">
+      <div class="h">③ Public WS</div>
+      <ul>
+        <li>ticker_stream → live mark + last/bid/ask cache</li>
+        <li>Computes live PnL locally</li>
+        <li>Feeds the pre-trade price display</li>
+        <li>Evaluates Strat1 each tick</li>
+      </ul>
+    </div>
+    <div class="lane work">
+      <div class="h">④ Worker queue</div>
+      <ul>
+        <li>Runs REST ops dispatched from the WS threads (e.g. Strat1 amends)</li>
+        <li>Keeps slow REST off the WS callbacks</li>
+      </ul>
+    </div>
+  </div>
+  <div class="shared">
+    shared state: <b>self._trades</b> (dict of TradeState) &nbsp;·&nbsp; guarded by a single <b>RLock</b>
+    &nbsp;·&nbsp; every cross-thread update reaches the GUI only as a <b>clone() snapshot</b> over a Qt signal
+  </div>
+  <p style="margin-top:16px;">Two patterns make this safe: (1) <strong>snapshots, not shared objects</strong> — threads
+  emit <code>clone()</code> copies so the UI never reads an object mid-mutation; (2) <strong>optimistic
+  local update + rollback</strong> — Strat1 updates its in-memory stop immediately to suppress duplicate
+  triggers, dispatches the REST amend to the worker, and rolls back if the amend fails.</p>
+
+  <!-- ════════════════════════ 06 ════════════════════════ -->
+  <h2 id="lifecycle">06 · Trade lifecycle</h2>
+  <p>Each trade is a small state machine keyed first by our client order ID, then re-keyed to Bybit's order ID once it's known.</p>
+  <div class="fsm">
+    <div class="state start">PENDING</div>
+    <div class="edge"><span class="ar">→</span><span class="lab">partial fill</span></div>
+    <div class="state">PARTIAL</div>
+    <div class="edge"><span class="ar">→</span><span class="lab">fully filled</span></div>
+    <div class="state">LIVE</div>
+    <div class="edge"><span class="ar">→</span><span class="lab">TP hit</span></div>
+    <div class="state win">CLOSED ✓</div>
+  </div>
+  <div class="fsm" style="margin-top:10px;">
+    <div class="state start">PENDING</div>
+    <div class="edge"><span class="ar">→</span><span class="lab">cancelled</span></div>
+    <div class="state term">CANCELLED</div>
+    <span style="width:30px;"></span>
+    <div class="state">LIVE</div>
+    <div class="edge"><span class="ar">→</span><span class="lab">SL hit</span></div>
+    <div class="state lose">CLOSED ✗</div>
+  </div>
+  <p style="margin-top:14px;">A partial fill that gets its remainder cancelled promotes straight to
+  <strong>LIVE</strong> at the filled size. A LIVE trade can also exit via <strong>close mkt</strong>
+  (reduce-only market order, recorded as a <em>Manual</em> close). On boot, <code>sync_existing()</code>
+  rebuilds this machine for any positions or resting orders already on the account — including ones placed
+  elsewhere — and re-arms Strat1 from the risk ledger on trades that were opened with it. The status pill
+  reflects <em>actual</em> WebSocket health (polled every 5s) and degrades visibly to the 30s REST fallback
+  when a stream drops.</p>
+
+  <!-- ════════════════════════ 07 ════════════════════════ -->
+  <h2 id="strat1">07 · Strat1 — the de-risking trail</h2>
+  <p>Strat1 is a deliberately simple heuristic, not a profit-maximiser. Because targets sit near expected
+  resistance, once price has "basically done the job" the goal is to <em>not give it back</em> — so the
+  stop ratchets toward break-even in two phases, measured as progress along the entry → TP journey:</p>
+  <table>
+    <tr><th>Trigger</th><th>Action</th><th>Phase</th></tr>
+    <tr><td>≥ 75% to TP</td><td>Stop → entry ± (half the original stop distance)</td><td>1</td></tr>
+    <tr><td>≥ 90% to TP</td><td>Stop → <strong>true break-even</strong> (offset past entry to cover round-trip fees, so a stop-out nets ~$0)</td><td>2</td></tr>
+  </table>
+  <p>Amendments are rate-limited to one per 5 seconds per symbol, applied optimistically in memory, executed
+  on the worker thread, and rolled back if the exchange rejects them. It never trails into profit — by
+  design; that would be a different strategy.</p>
+  <p><strong>Strat1 survives restarts.</strong> The original SL/TP and the current phase are persisted in the
+  risk ledger at placement and on every successful amend; on boot, <code>sync_existing()</code> matches the
+  position back to its ledger entry (by client order ID for resting entries, by symbol + entry price for
+  live positions) and re-arms the trail at the recorded phase. Trades placed before this persistence existed
+  can't be restored — the app logs a loud warning instead of failing silently.</p>
+
+  <!-- ════════════════════════ 08 ════════════════════════ -->
+  <h2 id="journal">08 · Journal sync</h2>
+  <p>The journal mirrors Bybit's closed-PnL history (the source of truth, fee-inclusive), so it captures
+  every closed trade — even ones closed while the app was off — with zero duplication. The full model,
+  with diagrams, lives in its own page:</p>
+  <p style="margin-bottom:30px;"><a href="journal-sync.html">→ How the journal stays complete</a></p>
+
+  <!-- ════════════════════════ 09 ════════════════════════ -->
+  <h2 id="config">09 · Config &amp; data files</h2>
+  <h3>Environment (<code>.env</code>)</h3>
+  <table>
+    <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+    <tr><td><code>BYBIT_API_KEY / _SECRET</code></td><td>—</td><td>UTA API credentials (Contract orders + positions).</td></tr>
+    <tr><td><code>BYBIT_TESTNET</code></td><td><code>false</code></td><td>Point at testnet.</td></tr>
+    <tr><td><code>DEFAULT_RISK_USD</code></td><td><code>100</code></td><td>Default net-loss risk per trade.</td></tr>
+    <tr><td><code>FEE_MAKER_RATE</code></td><td><code>0.0002</code></td><td>Maker fee (limit fills) — used in sizing, break-even, journal.</td></tr>
+    <tr><td><code>FEE_TAKER_RATE</code></td><td><code>0.00055</code></td><td>Taker fee (market stop / fills).</td></tr>
+    <tr><td><code>SL_TRIGGER_BY</code></td><td><code>MarkPrice</code></td><td>Stop trigger reference (<code>MarkPrice</code> or <code>LastPrice</code>).</td></tr>
+    <tr><td><code>JOURNAL_BACKFILL_DAYS</code></td><td><code>30</code></td><td>Cold-start history backfill window.</td></tr>
+  </table>
+  <h3>On-disk state (git-ignored)</h3>
+  <table>
+    <tr><th>File</th><th>Role</th></tr>
+    <tr><td><code>bybit_symbology.json</code></td><td>Instrument + MMR cache (regenerated, 24h TTL).</td></tr>
+    <tr><td><code>trade_journal.json</code></td><td>Permanent, append-only trade archive.</td></tr>
+    <tr><td><code>risk_ledger.json</code></td><td>Per app-placed trade: intended $ risk (for R-multiples), original SL/TP + Strat1 phase (for restart restore), and closing order IDs (for exact journal joins).</td></tr>
+  </table>
+
+  <p class="foot">Viridis · personal proprietary execution engine. This guide reflects the engine as of the
+  Strat1 restart-restore, market close, live pre-trade price, and execution/wallet stream work
+  (on top of fee-aware sizing, Mark-Price stops, and the exchange-mirrored journal).</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Viridis — How the Journal Stays Complete</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="doc">
+    <div class="kicker">Viridis · Trade Journal</div>
+    <h1>How your journal stays complete</h1>
+    <p>Even when the app is closed most of the time.</p>
+  </header>
+  <div class="crumbs"><a href="index.html">← Architecture &amp; design guide</a></div>
+
+  <p><strong>Short answer:</strong> yes — your local journal becomes a permanent, ever-growing
+  archive, and Bybit's endpoint is only used to top it up with what's new.</p>
+
+  <h2 id="cores">The core idea — two stores, opposite behaviour</h2>
+  <div class="cols2">
+    <div class="store roll">
+      <span class="lbl">Rolling window</span>
+      <h3>Bybit <code>closed-PnL</code></h3>
+      <p>Only retains recent history (~2 years), then trades fall off the back. It's a
+      <em>source you sip from</em> — not your archive.</p>
+    </div>
+    <div class="store perm">
+      <span class="lbl">Permanent</span>
+      <h3>Your <code>trade_journal.json</code></h3>
+      <p>Append-only. Nothing is ever removed. Once a trade is written locally it stays
+      <strong>forever</strong> — even after Bybit stops returning it.</p>
+    </div>
+  </div>
+  <p>So your local file is a <strong>superset that only grows</strong>. Bybit is just where you
+  fetch the <strong>delta</strong> — the trades that happened since the newest one you already have.</p>
+
+  <div class="timeline">
+    <div class="trow">
+      <div class="tlabel">Bybit closed-PnL <span class="tag">— rolling, ~2-year retention</span></div>
+      <div class="track">
+        <div class="seg faded">aged out · gone from Bybit</div>
+        <div class="seg query">still queryable</div>
+      </div>
+    </div>
+    <div class="trow">
+      <div class="tlabel">Your trade_journal.json <span class="tag">— permanent, append-only</span></div>
+      <div class="track">
+        <div class="seg perm">everything you've ever reconciled · kept locally forever</div>
+      </div>
+    </div>
+    <div class="nowline"></div>
+    <div class="nowtag">now ▸</div>
+  </div>
+  <p class="cap">The instant a trade enters your local journal, its survival no longer depends on
+  Bybit. That's the whole point — the green bar never shrinks.</p>
+
+  <h2 id="flow">How a reconcile decides what to fetch</h2>
+  <div class="flow">
+    <div class="node process">App opens &nbsp;/&nbsp; every 30s tick</div>
+    <div class="arrow">↓</div>
+    <div class="node decision">Local journal empty?</div>
+    <div class="branches">
+      <div class="branch red"><span class="k">cold</span> start = <b>now − 30 days</b> <span class="muted">(JOURNAL_BACKFILL_DAYS)</span></div>
+      <div class="branch green"><span class="k">has data</span> start = <b>newest close already in the journal</b></div>
+    </div>
+    <div class="arrow">↓</div>
+    <div class="node process">Fetch Bybit closed-PnL from <b>start → now</b><br><span class="muted">chunked in ≤7-day windows · paginated</span></div>
+    <div class="arrow">↓</div>
+    <div class="node decision">Closing order ID already in journal?</div>
+    <div class="branches">
+      <div class="branch red"><span class="k">yes</span> skip — duplicate</div>
+      <div class="branch green"><span class="k">no</span> attach R from risk ledger → append<br><span class="muted">matched by closing order ID first (exact — recorded when the bracket fires), then entry price (±0.1%, external closes only)</span></div>
+    </div>
+    <div class="arrow">↓</div>
+    <div class="node store">trade_journal.json &nbsp;·&nbsp; permanent · append-only</div>
+    <div class="arrow">↓</div>
+    <div class="node process">stats &nbsp;+&nbsp; history pop-out</div>
+  </div>
+  <p class="cap">The key step is the <span class="accent">has-data</span> branch: on every normal run it
+  starts from <em>the newest trade you already have</em> and pulls forward. It does not re-pull a
+  fixed window each time — it pulls exactly the gap.</p>
+
+  <h2 id="qa">Your questions, precisely</h2>
+
+  <div class="qa">
+    <div class="q"><span class="num">1</span><span>Capture everything even if the app's closed most of the time?</span></div>
+    <p><span class="badge">Yes</span>&nbsp; Each time you open it, it fetches everything that closed
+    since your last recorded trade and merges it. Your archive grows monotonically; it never shrinks.</p>
+  </div>
+
+  <div class="qa">
+    <div class="q"><span class="num">2</span><span>Does local data persist beyond Bybit's recent window?</span></div>
+    <p><span class="badge">Yes, permanently</span>&nbsp; Bybit's endpoint is only consulted for the
+    <em>delta</em>. A trade you fetched 8 months ago stays in <code>trade_journal.json</code> even
+    after it ages out of Bybit's queryable range. Local is the durable copy.</p>
+  </div>
+
+  <div class="qa">
+    <div class="q"><span class="num">3</span><span>Real gaps only if I'm away longer than Bybit's retention?</span></div>
+    <p><span class="badge">Exactly right</span>&nbsp; The threshold is <strong>Bybit's retention (~2 years)</strong>
+    — not the 7-day window or the 30-day backfill. Go away for 3 months and the next open chunks
+    ~13 seven-day windows from your last trade to now and recovers all of it — <strong>zero gap</strong>.</p>
+    <p>You'd only lose data if a trade closed <em>and</em> you never opened the app again until that
+    trade had already fallen off Bybit's ~2-year window. For someone who opens this to place trades,
+    that effectively never happens.</p>
+  </div>
+
+  <div class="qa">
+    <div class="q"><span class="num">4</span><span>Duplication of already-seen trades?</span></div>
+    <p><span class="badge">Can't happen</span>&nbsp; Every trade is deduped by its <strong>closing order ID</strong>
+    against a <code>_seen</code> set that's rebuilt from the journal file on startup (so dedup survives
+    restarts, not just within a session).</p>
+    <p>It even <em>deliberately</em> re-fetches the boundary trade each time (a 1-second overlap so nothing
+    slips through the crack), and the dedup gate silently drops it. R-multiples are also gated to
+    only-new records, so a re-fetched trade can't re-consume your risk ledger.</p>
+    <p>The R-multiple match itself is exact for app-managed closes: when a TP/SL child fires (or you market-close
+    from the app), the closing order ID is written into the risk ledger, and the reconcile joins on that ID.
+    Re-entering the same symbol at the same price can't attribute the wrong risk. The fuzzy
+    symbol&nbsp;+&nbsp;entry-price match (±0.1%) survives only as a fallback for trades closed outside the app.</p>
+  </div>
+
+  <h2 id="coldstart">One caveat to act on — the cold start</h2>
+  <div class="callout warn">
+    <h3>⚠ First run only: backfills 30 days</h3>
+    <p>The first time you run this code the journal is empty, so it backfills only
+    <strong>30 days</strong> (the <span class="neg">cold</span> branch). Trades older than 30 days from
+    that first run won't be pulled in. After that it's incremental-from-last-close forever, so this only bites once.</p>
+    <p>If you want your <strong>full</strong> history captured on that first launch, set this in
+    <code>.env</code> for the first run, then remove it:</p>
+    <pre>JOURNAL_BACKFILL_DAYS=730</pre>
+    <p>That backfills ~2 years (Bybit's retention) in 7-day chunks on first
+    launch — slower (many requests), but a one-time pull. From then on every open just sips the delta.</p>
+  </div>
+
+  <p class="foot">Footnote: <code>closedPnl</code> is net of <em>trading fees</em> but <strong>not funding</strong>,
+  so very long holds will read slightly rosy in the journal.</p>
+
+</div>
+</body>
+</html>
