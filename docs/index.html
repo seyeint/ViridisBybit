@@ -25,6 +25,7 @@
     <a href="#strat1"><span class="n">07</span> &nbsp;Strat1 trailing</a>
     <a href="#journal"><span class="n">08</span> &nbsp;Journal sync</a>
     <a href="#config"><span class="n">09</span> &nbsp;Config &amp; data files</a>
+    <a href="#board"><span class="n">10</span> &nbsp;The board</a>
   </div>
 
   <!-- ════════════════════════ 01 ════════════════════════ -->
@@ -46,13 +47,15 @@
 
   <!-- ════════════════════════ 02 ════════════════════════ -->
   <h2 id="architecture">02 · Architecture &amp; signal flow</h2>
-  <p>Six modules, sharply separated. All exchange I/O is non-blocking; all GUI updates travel through Qt signals.</p>
+  <p>Sharply separated modules. All exchange I/O is non-blocking; all GUI updates travel through Qt signals.</p>
   <div class="grid">
-    <div class="mod"><div class="fn">config.py</div><div class="ds">.env → typed constants: API keys, fee rates, SL trigger reference, cache &amp; journal settings.</div></div>
-    <div class="mod"><div class="fn">cache_engine.py</div><div class="ds">Instrument symbology + per-symbol maintenance-margin rate. Paginated pull, cached to disk (24h TTL), O(1) lookup.</div></div>
-    <div class="mod"><div class="fn">trading_core.py</div><div class="ds">The engine: risk math, OTOCO execution, REST + dual WebSocket state machine, Strat1, journal reconciliation. No GUI.</div></div>
-    <div class="mod"><div class="fn">journal.py</div><div class="ds">Append-only trade journal, deduped by closing order ID, mirrored from Bybit's closed-PnL. Stats + R-multiples.</div></div>
-    <div class="mod"><div class="fn">main.py</div><div class="ds">PyQt6 terminal GUI. Owns the SignalBridge, renders trade cards, preview, journal, logs.</div></div>
+    <div class="mod"><div class="fn">config.py</div><div class="ds">.env → typed constants: API keys, fee rates, SL trigger reference, governance caps, Strat1 ratchet, cache &amp; journal settings.</div></div>
+    <div class="mod"><div class="fn">cache_engine.py</div><div class="ds">Instrument symbology + every risk-limit tier per symbol (MMR, max leverage, cap). Paginated pull, cached to disk (24h TTL), O(1) lookup.</div></div>
+    <div class="mod"><div class="fn">trading_core.py</div><div class="ds">The engine: risk math, OTOCO execution, REST + dual WebSocket state machine, Strat1 ratchet, risk ledger, journal reconciliation. No GUI. The single writer of trade state.</div></div>
+    <div class="mod"><div class="fn">journal.py</div><div class="ds">Append-only trade journal, deduped by closing order ID, mirrored from Bybit's closed-PnL. Stats, windows, streaks, R / MFE / MAE.</div></div>
+    <div class="mod"><div class="fn">main.py</div><div class="ds">PyQt6 board: the ticket with its live preview and ladder, position cards with inline actions, the governance strip, stats strip and log drawer.</div></div>
+    <div class="mod"><div class="fn">theme.py · widgets.py</div><div class="ds">Palette + stylesheet, and the painted widgets: ladder, mini ladder, R histogram, equity curve, hinted inputs, meters.</div></div>
+    <div class="mod"><div class="fn">tests/</div><div class="ds">Unit tests for the pure math — sizing, tiers, cushion, relative inputs, ratchet, journal join. <code>python -m unittest discover -s tests</code></div></div>
     <div class="mod"><div class="fn">test_trade.py</div><div class="ds">CLI dry-run harness: prints the exact payload, leverage, margin, and fee estimate before optionally firing.</div></div>
   </div>
 
@@ -99,7 +102,17 @@ qty       = 50 / (1000 + 55.18)            = 0.04738  <span class="c">→ 0.047 
     L = floor( 1 / ( sl_distance + MMR + fee_cushion ) ) &nbsp;&nbsp;<span style="color:var(--dim)">capped at the symbol's max</span>
   </div>
   <pre><span class="c"># BTC: sl_distance = 1000/74300 = 1.346% · MMR = 0.5% · cushion = 0.2%</span>
-L = floor( 1 / (0.01346 + 0.005 + 0.002) ) = floor(48.9) = <span class="g">48×</span></pre>
+L = floor( 1 / (0.01346 + 0.005 + 0.002) ) = floor(48.9) = <span class="g">48×</span>
+liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind the 73,300 stop</span></pre>
+  <div class="callout warn">
+    <h3>Which MMR? The tier the notional lands in</h3>
+    <p>Bybit raises the maintenance margin rate — and lowers max leverage — in <strong>risk-limit tiers</strong>
+    as position value grows. Half of all linear symbols end tier 1 at $5k or less, and a $100 risk on a 0.5%
+    stop is ~$20k of notional. Sizing with the base-tier MMR on such a symbol puts the real liquidation
+    <em>inside</em> the stop. The cache therefore stores every tier, and <code>calculate_trade</code> picks the
+    MMR and max leverage for the notional it just computed. Once the position is live, the exchange's own
+    <code>liqPrice</code> is tracked and compared to the stop; if it ever sits inside, the log shouts.</p>
+  </div>
   <div class="callout info">
     <h3>Why a Mark-Price stop trigger?</h3>
     <p>Liquidation is <em>always</em> evaluated on <strong>Mark Price</strong>. If your stop triggered on
@@ -120,13 +133,13 @@ L = floor( 1 / (0.01346 + 0.005 + 0.002) ) = floor(48.9) = <span class="g">48×<
   stopLoss:    sl,           slOrderType: <span class="a">"Market"</span>,  slTriggerBy: <span class="y">"MarkPrice"</span>,
   tpslMode:    <span class="a">"Partial"</span>,   timeInForce: <span class="a">"GTC"</span> <span class="c">(or "PostOnly" — cancel instead of crossing the book)</span>
 }</pre>
-  <p>The GUI shows the symbol's <strong>live last/bid/ask</strong> while you type (click to use as entry) and
-  warns when a limit entry would cross the book — a marketable limit fills <em>immediately as taker</em>, at
-  a different price and fee than the sizing assumed. The optional <code>post-only</code> checkbox turns that
-  warning into an exchange-side guarantee. After the fill, the private execution stream verifies the
-  assumption: a taker entry is flagged in the log with actual vs planned fees. A live position can always be
-  exited instantly via <strong>close mkt</strong> (reduce-only market order + a sweep that cancels any
-  orphaned TP/SL conditionals).</p>
+  <p>The ticket shows the symbol's <strong>live last / bid / ask and spread</strong> while you type (click the
+  price to use it as entry) and warns when a limit entry would cross the book — a marketable limit fills
+  <em>immediately as taker</em>, at a different price and fee than the sizing assumed. <code>post-only</code>
+  is on by default and turns that warning into an exchange-side guarantee. After the fill, the private
+  execution stream verifies the assumption: a taker entry is flagged in the log with actual vs planned fees.
+  A live position can always be exited instantly via <strong>close mkt</strong> (reduce-only market order +
+  a sweep that cancels any orphaned TP/SL conditionals).</p>
 
   <h3>The midpoint-trigger trick (for a maker TP fill)</h3>
   <p>The TP <em>trigger</em> is set at the midpoint between entry and target, while the limit <em>price</em>
@@ -222,18 +235,24 @@ L = floor( 1 / (0.01346 + 0.005 + 0.002) ) = floor(48.9) = <span class="g">48×<
   when a stream drops.</p>
 
   <!-- ════════════════════════ 07 ════════════════════════ -->
-  <h2 id="strat1">07 · Strat1 — the de-risking trail</h2>
+  <h2 id="strat1">07 · Strat1 — the de-risking ratchet</h2>
   <p>Strat1 is a deliberately simple heuristic, not a profit-maximiser. Because targets sit near expected
   resistance, once price has "basically done the job" the goal is to <em>not give it back</em> — so the
-  stop ratchets toward break-even in two phases, measured as progress along the entry → TP journey:</p>
+  stop ratchets as price progresses along the entry → TP journey. The table is configurable
+  (<code>STRAT1_RATCHET</code>, "progress:lockR, …"); the default is the original two-step trail:</p>
   <table>
     <tr><th>Trigger</th><th>Action</th><th>Phase</th></tr>
-    <tr><td>≥ 75% to TP</td><td>Stop → entry ± (half the original stop distance)</td><td>1</td></tr>
-    <tr><td>≥ 90% to TP</td><td>Stop → <strong>true break-even</strong> (offset past entry to cover round-trip fees, so a stop-out nets ~$0)</td><td>2</td></tr>
+    <tr><td>≥ 75% to TP</td><td>Lock −0.5R: stop → entry ± (half the original stop distance)</td><td>1</td></tr>
+    <tr><td>≥ 90% to TP</td><td>Lock 0R: stop → <strong>true break-even</strong> (offset past entry to cover round-trip fees, so a stop-out nets ~$0)</td><td>2</td></tr>
   </table>
-  <p>Amendments are rate-limited to one per 5 seconds per symbol, applied optimistically in memory, executed
-  on the worker thread, and rolled back if the exchange rejects them. It never trails into profit — by
-  design; that would be a different strategy.</p>
+  <p>A positive lock (say <code>0.9:0.5</code>) sits at break-even plus that many R. The phase is the number
+  of steps applied, so a fast move skips straight to the highest step reached. Two guards: the stop
+  <strong>never loosens</strong> (a manually tightened stop beyond the ratchet level just records the phase)
+  and <strong>never crosses the mark</strong> (a lock past the current price would be a market exit — the step
+  is skipped with a loud log line). Amendments are rate-limited to one per 5 seconds per symbol, applied
+  optimistically in memory, executed on the worker thread, and rolled back if the exchange rejects them.
+  Whether it is worth it is a question for the journal: every app-placed trade records its MFE and MAE in R,
+  so the giveback Strat1 saves can be measured against the winners it cuts short.</p>
   <p><strong>Strat1 survives restarts.</strong> The original SL/TP and the current phase are persisted in the
   risk ledger at placement and on every successful amend; on boot, <code>sync_existing()</code> matches the
   position back to its ledger entry (by client order ID for resting entries, by symbol + entry price for
@@ -259,18 +278,55 @@ L = floor( 1 / (0.01346 + 0.005 + 0.002) ) = floor(48.9) = <span class="g">48×<
     <tr><td><code>FEE_TAKER_RATE</code></td><td><code>0.00055</code></td><td>Taker fee (market stop / fills).</td></tr>
     <tr><td><code>SL_TRIGGER_BY</code></td><td><code>MarkPrice</code></td><td>Stop trigger reference (<code>MarkPrice</code> or <code>LastPrice</code>).</td></tr>
     <tr><td><code>JOURNAL_BACKFILL_DAYS</code></td><td><code>30</code></td><td>Cold-start history backfill window.</td></tr>
+    <tr><td><code>RISK_LEDGER_MAX_AGE_DAYS</code></td><td><code>365</code></td><td>Ledger entries older than this are pruned. Keep it above your longest hold, or a restart loses Strat1 and R on that trade.</td></tr>
+    <tr><td><code>MAX_RISK_PCT</code></td><td><code>2.0</code></td><td>Risk on one trade above this share of equity asks for a hard confirm.</td></tr>
+    <tr><td><code>MAX_OPEN_RISK_PCT</code></td><td><code>6.0</code></td><td>Open risk (sum of $ at the stops) above this share of equity asks for a confirm.</td></tr>
+    <tr><td><code>DAILY_LOSS_LIMIT_USD</code></td><td><code>0</code></td><td>Realised loss today at which no new trades are accepted. 0 = off.</td></tr>
+    <tr><td><code>LOSS_STREAK_CONFIRM</code></td><td><code>3</code></td><td>Consecutive losses at which a new trade asks for a confirm. 0 = off.</td></tr>
+    <tr><td><code>STRAT1_RATCHET</code></td><td><code>0.75:-0.5,0.90:0</code></td><td>Strat1 table: at ≥ progress to TP, lock that many R (see §07).</td></tr>
   </table>
   <h3>On-disk state (git-ignored)</h3>
   <table>
     <tr><th>File</th><th>Role</th></tr>
-    <tr><td><code>bybit_symbology.json</code></td><td>Instrument + MMR cache (regenerated, 24h TTL).</td></tr>
-    <tr><td><code>trade_journal.json</code></td><td>Permanent, append-only trade archive.</td></tr>
-    <tr><td><code>risk_ledger.json</code></td><td>Per app-placed trade: intended $ risk (for R-multiples), original SL/TP + Strat1 phase (for restart restore), and closing order IDs (for exact journal joins).</td></tr>
+    <tr><td><code>bybit_symbology.json</code></td><td>Instrument + risk-limit tier cache (regenerated, 24h TTL; an old-schema file is refreshed on boot).</td></tr>
+    <tr><td><code>trade_journal.json</code></td><td>Permanent, append-only trade archive. App-placed trades carry R, MFE and MAE.</td></tr>
+    <tr><td><code>risk_ledger.json</code></td><td>Per app-placed trade: intended $ risk (for R-multiples), original SL + live TP + Strat1 phase (for restart restore), MFE/MAE, and closing order IDs (for exact journal joins).</td></tr>
   </table>
 
+  <!-- ════════════════════════ 10 ════════════════════════ -->
+  <h2 id="board">10 · The board</h2>
+  <p>The window is a ticket, a set of position cards, and an account-level risk strip. The rule behind all
+  three: <strong>every number the trade depends on is on screen before the trade exists</strong>, and every
+  action on a live trade is one click on the card it belongs to.</p>
+  <h3>Ticket</h3>
+  <ul>
+    <li><strong>Live preview.</strong> Every keystroke recomputes leverage, quantity, notional, margin, fees, R:R,
+    liquidation and cushion. Warnings are ranked — amber asks for a confirm, red blocks — and the confirm sheet
+    lists them again before anything is sent.</li>
+    <li><strong>Relative inputs.</strong> Stop as a price or a distance (<code>-0.8%</code>), target as a price, a
+    percent (<code>+3%</code>) or an R multiple (<code>2R</code>), risk in dollars or as a share of equity
+    (<code>1%</code>). The hint inside each field shows the form you did not type. Arrow keys nudge by tick
+    (shift ×10), Enter moves on, ⌘Enter executes, Esc resets.</li>
+    <li><strong>Ladder.</strong> Target, mark, entry, stop and liquidation on one price scale, each with its distance,
+    the dollars at that level and the R. The cushion between liquidation and stop is visible, not implied.</li>
+  </ul>
+  <h3>Cards</h3>
+  <p>One per active trade: a severity stripe, a mini ladder with liquidation and the max favourable excursion,
+  the cushion behind the stop (exchange-reported once live, estimated before), MFE/MAE in R, Strat1 phase and
+  next step, and inline actions — stop to break-even, stop to −0.5R, close at market, cancel, edit TP/SL.
+  Actions resolve to the core's own trade object, so the next ticker snapshot carries the change instead of
+  reverting it. A stop that would trigger immediately is refused before it is sent.</p>
+  <h3>Governance strip</h3>
+  <p>Open risk (sum of dollars at the stops across active trades, derived from the bracket for positions the
+  app did not place), today's realised PnL against the daily limit, and the loss streak. The caps are
+  <code>.env</code> settings; a breached daily limit disables execute until tomorrow. This is what replaced
+  the exposure heat bar: notional over equity says nothing under leverage-derived sizing, dollars at the
+  stops do.</p>
+
   <p class="foot">Viridis · personal proprietary execution engine. This guide reflects the engine as of the
-  Strat1 restart-restore, market close, live pre-trade price, and execution/wallet stream work
-  (on top of fee-aware sizing, Mark-Price stops, and the exchange-mirrored journal).</p>
+  board rewrite (live preview, ladder, cards, governance strip), tier-aware MMR with the liquidation check,
+  the configurable Strat1 ratchet, and MFE/MAE in the journal — on top of fee-aware sizing, Mark-Price
+  stops, restart-restore, and the exchange-mirrored journal.</p>
 
 </div>
 </body>
