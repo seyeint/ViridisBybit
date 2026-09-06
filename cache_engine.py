@@ -44,8 +44,26 @@ class InstrumentCache:
             maxLev     : float (maximum allowed leverage)
             minNotional: str   (minimum notional value in USDT)
             mmr        : float (base-tier maintenance margin rate, e.g. 0.005 = 0.5%)
+            tiers      : list  (risk-limit tiers, ascending: {limit, mmr, maxLev})
         """
         return self._data.get(symbol)
+
+    @staticmethod
+    def tier_for(rules: dict, notional: float) -> dict:
+        """
+        The risk-limit tier that applies to a position of *notional* USDT:
+        {limit, mmr, maxLev, index, count}. Bybit auto-adjusts the tier with
+        position value, raising MMR and lowering max leverage as it grows, so
+        sizing must use the tier the trade will actually land in.
+        """
+        tiers = rules.get("tiers") or []
+        if not tiers:
+            return {"limit": float("inf"), "mmr": rules.get("mmr", 0.005),
+                    "maxLev": rules.get("maxLev", 1.0), "index": 0, "count": 1}
+        for i, tier in enumerate(tiers):
+            if notional <= tier["limit"]:
+                return {**tier, "index": i, "count": len(tiers)}
+        return {**tiers[-1], "index": len(tiers) - 1, "count": len(tiers)}
 
     def refresh(self) -> None:
         """Force a fresh pull from the exchange, ignoring TTL."""
@@ -81,7 +99,9 @@ class InstrumentCache:
                 self._data = {}
 
             age = time.time() - os.path.getmtime(config.CACHE_FILE)
-            if age < config.CACHE_TTL_SECONDS:
+            # A cache written before tiers were stored is refreshed like an expired one.
+            stale_schema = any("tiers" not in v for v in self._data.values())
+            if age < config.CACHE_TTL_SECONDS and not stale_schema:
                 if on_complete:
                     on_complete(len(self._data))
                 return
@@ -129,8 +149,13 @@ class InstrumentCache:
             if not cursor:
                 break
 
-        # ── Step 2: Fetch base-tier MMR from risk limit API ──────
+        # ── Step 2: Fetch ALL risk-limit tiers per symbol ─────────
+        #    Bybit raises MMR (and lowers max leverage) as position value
+        #    crosses each tier's limit. On most alts tier 1 ends at
+        #    $5k–$20k, well inside a $100-risk trade, so the base tier
+        #    alone would overstate the liquidation distance.
         rl_cursor = ""
+        tiers_by_sym: Dict[str, list] = {}
         for _ in range(50):  # safety bound on pagination
             rl_kwargs = {"category": "linear"}
             if rl_cursor:
@@ -142,16 +167,28 @@ class InstrumentCache:
 
                 for tier in rl_result.get("list", []):
                     sym = tier.get("symbol", "")
-                    # Only take the base tier (isLowestRisk == 1)
-                    if tier.get("isLowestRisk") == 1 and sym in temp_data:
-                        mmr_val = float(tier.get("maintenanceMargin", "0.005"))
-                        temp_data[sym]["mmr"] = mmr_val
+                    if sym not in temp_data:
+                        continue
+                    try:
+                        tiers_by_sym.setdefault(sym, []).append({
+                            "limit": float(tier.get("riskLimitValue") or 0),
+                            "mmr": float(tier.get("maintenanceMargin") or 0.005),
+                            "maxLev": float(tier.get("maxLeverage") or 0)
+                                      or temp_data[sym]["maxLev"],
+                        })
+                    except (TypeError, ValueError):
+                        continue
 
                 rl_cursor = rl_result.get("nextPageCursor", "")
                 if not rl_cursor:
                     break
             except Exception:
                 break  # Risk limit fetch is best-effort
+
+        for sym, tiers in tiers_by_sym.items():
+            tiers.sort(key=lambda t: t["limit"])
+            temp_data[sym]["tiers"] = tiers
+            temp_data[sym]["mmr"] = tiers[0]["mmr"]   # base tier, for display
 
         # Persist to disk
         try:

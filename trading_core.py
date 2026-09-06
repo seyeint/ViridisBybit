@@ -13,6 +13,7 @@ import copy
 import json
 import math
 import queue
+import re
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -55,6 +56,118 @@ def format_value(value: float, step_str: str, round_down: bool = False) -> str:
         precision = 0
 
     return f"{float(rounded):.{precision}f}"
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Pure helpers — relative inputs, break-even, Strat1 ratchet
+# ──────────────────────────────────────────────────────────────────
+
+_PCT_RE = re.compile(r"^([-+]?)(\d*\.?\d+)%$")
+_R_RE = re.compile(r"^([-+]?)(\d*\.?\d+)[rR]$")
+
+
+def _clean(raw) -> str:
+    return str(raw or "").strip().replace("$", "").replace(",", "").replace(" ", "")
+
+
+def parse_pct(raw) -> Optional[float]:
+    """'-1.35%' → 0.0135. The sign is ignored: direction comes from the side."""
+    m = _PCT_RE.match(_clean(raw))
+    return float(m.group(2)) / 100.0 if m else None
+
+
+def parse_r(raw) -> Optional[float]:
+    """'2R' → 2.0. None when the text is not an R expression."""
+    m = _R_RE.match(_clean(raw))
+    return float(m.group(2)) if m else None
+
+
+def resolve_stop(raw, entry: float, side: str) -> float:
+    """Stop as a price, or as a % distance from entry ('0.8%' or '-0.8%')."""
+    p = parse_pct(raw)
+    if p is not None:
+        if entry <= 0:
+            raise ValueError("enter an entry before a % stop")
+        return entry * (1 - p) if side == "Buy" else entry * (1 + p)
+    try:
+        return float(_clean(raw))
+    except ValueError:
+        raise ValueError(f"stop '{raw}' is not a price or a %")
+
+
+def resolve_target(raw, entry: float, sl: float, side: str) -> float:
+    """Target as a price, a % from entry ('+3%'), or a multiple of the stop distance ('2R')."""
+    r = parse_r(raw)
+    if r is not None:
+        dist = abs(entry - sl)
+        if entry <= 0 or dist <= 0:
+            raise ValueError("enter entry and stop before an R target")
+        return entry + r * dist if side == "Buy" else entry - r * dist
+    p = parse_pct(raw)
+    if p is not None:
+        if entry <= 0:
+            raise ValueError("enter an entry before a % target")
+        return entry * (1 + p) if side == "Buy" else entry * (1 - p)
+    try:
+        return float(_clean(raw))
+    except ValueError:
+        raise ValueError(f"target '{raw}' is not a price, a % or an R multiple")
+
+
+def resolve_risk(raw, equity: Optional[float]) -> float:
+    """Risk in dollars ('50', '$50') or as a share of equity ('1%')."""
+    p = parse_pct(raw)
+    if p is not None:
+        if not equity or equity <= 0:
+            raise ValueError("equity unknown — enter risk in dollars")
+        return equity * p
+    try:
+        return float(_clean(raw))
+    except ValueError:
+        raise ValueError(f"risk '{raw}' is not a dollar amount or a %")
+
+
+def breakeven_price(entry: float, side: str) -> float:
+    """Exit price at which a maker entry plus a taker exit nets zero after fees."""
+    if side == "Buy":
+        return entry * (1 + config.FEE_MAKER) / (1 - config.FEE_TAKER)
+    return entry * (1 - config.FEE_MAKER) / (1 + config.FEE_TAKER)
+
+
+def ratchet_price(entry: float, sl_distance: float, side: str, lock_r: float) -> float:
+    """
+    Stop price that locks *lock_r* R, measured in original stop distances:
+      lock_r < 0 → still risking |lock_r| R (-0.5 = half the original stop distance)
+      lock_r = 0 → fee-adjusted break-even
+      lock_r > 0 → break-even plus lock_r R of profit
+    """
+    long = side == "Buy"
+    if lock_r < 0:
+        return entry + lock_r * sl_distance if long else entry - lock_r * sl_distance
+    be = breakeven_price(entry, side)
+    return be + lock_r * sl_distance if long else be - lock_r * sl_distance
+
+
+def parse_ratchet(spec: str) -> List[tuple]:
+    """
+    'progress:lockR,…' → sorted [(progress, lock_r), …]. Progress is the share
+    of the entry→TP journey at which the stop moves. Falls back to the original
+    Strat1 table (75% → -0.5R, 90% → break-even) when the spec is unusable.
+    """
+    steps = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            p, r = part.split(":")
+            p, r = float(p), float(r)
+        except ValueError:
+            continue
+        if 0 < p <= 1:
+            steps.append((p, r))
+    steps.sort()
+    return steps or [(0.75, -0.5), (0.90, 0.0)]
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -102,7 +215,15 @@ class TradeState:
         self.original_tp: Optional[float] = None            # TP value at creation
         # Timestamps
         self.opened_at: Optional[float] = None  # time.time() when trade was created
+        self.closed_at: Optional[float] = None  # time.time() when it went CLOSED/CANCELLED
         self.risk_usd: Optional[float] = None    # dollar risk at SL for R-multiple
+        # Liquidation: exchange-reported once live (estimate from sizing before)
+        self.liq_price: Optional[float] = None
+        self.liq_warned: bool = False
+        self.tier: Optional[int] = None          # risk-limit tier the sizing used (1 = base)
+        # Excursions: best / worst mark seen while live (journaled on close)
+        self.mfe_price: Optional[float] = None
+        self.mae_price: Optional[float] = None
 
     @property
     def is_active(self) -> bool:
@@ -131,12 +252,12 @@ class TradingCore:
         on_log: Optional[Callable[[str, bool], None]] = None,
         on_trade_update: Optional[Callable[[TradeState], None]] = None,
         on_cache_complete: Optional[Callable[[int], None]] = None,
-        on_balance: Optional[Callable[[float], None]] = None,
+        on_balance: Optional[Callable[[float, Optional[float]], None]] = None,
     ):
         # Callbacks
         self._on_log = on_log or (lambda msg, err: print(f"[{'!' if err else '>'}] {msg}"))
         self._on_trade_update = on_trade_update or (lambda _: None)
-        self._on_balance = on_balance or (lambda _: None)
+        self._on_balance = on_balance or (lambda *_: None)   # (equity, available)
 
         # REST client
         self.client = HTTP(
@@ -175,6 +296,8 @@ class TradingCore:
 
         # Strat1 rate limiter: symbol → last amendment timestamp
         self._strat1_last_amend: Dict[str, float] = {}
+        # Strat1 ratchet table [(progress, lock_r), …] from config
+        self._ratchet = parse_ratchet(config.STRAT1_RATCHET)
 
         # Risk ledger: remembers intended $ risk per app-placed trade so the
         # journal can attach R-multiples (matched on symbol + entry price).
@@ -240,6 +363,7 @@ class TradingCore:
             snapshot = None
             link_id = None
             entry_ref = 0.0
+            mfe = mae = None
             with self._lock:
                 trade = self._trades.get(trade_entry_order_id)
                 if trade:
@@ -247,10 +371,12 @@ class TradingCore:
                     trade.stop_loss = str_sl
                     link_id = trade.order_link_id
                     entry_ref = trade.entry_price or trade.fill_price or 0.0
+                    mfe, mae = trade.mfe_price, trade.mae_price
                     snapshot = trade.clone()
             if snapshot:
                 self._on_trade_update(snapshot)
-            self._update_risk_intent_phase(symbol, entry_ref, link_id, new_phase)
+            self._update_risk_intent(symbol, entry_ref, link_id,
+                                     strat1_phase=new_phase, mfe=mfe, mae=mae)
             self.log(f"strat1 [{symbol}]: SL successfully amended at {str_sl}")
 
         except Exception as e:
@@ -329,6 +455,65 @@ class TradingCore:
         elif order_id not in self._trades:
             self._trades[order_id] = trade
 
+    def _resolve_core_trade(self, trade: TradeState) -> TradeState:
+        """
+        The core's own TradeState for a trade the GUI hands us (usually a clone).
+        Mutating the clone would leave the core stale, and the next ticker
+        snapshot would silently revert the change in the UI.
+        """
+        with self._lock:
+            found = self._trades.get(trade.entry_order_id)
+            if found is None:
+                for t in self._trades.values():
+                    if t.symbol == trade.symbol and t.is_active:
+                        found = t
+                        break
+        return found or trade
+
+    @staticmethod
+    def estimate_trade_risk(trade: TradeState) -> Optional[float]:
+        """
+        Dollars lost if the stop fills: the intended risk for app-placed
+        trades, else derived from the bracket (price move + round-trip fees).
+        None when there is no stop to derive it from.
+        """
+        if trade.risk_usd:
+            return float(trade.risk_usd)
+        ref = trade.fill_price or trade.entry_price
+        qty = trade.qty or trade.entry_qty
+        if not ref or not qty or not trade.stop_loss:
+            return None
+        sl = float(trade.stop_loss)
+        q = float(qty)
+        return abs(ref - sl) * q + ref * q * config.FEE_MAKER + sl * q * config.FEE_TAKER
+
+    @staticmethod
+    def _track_excursion(trade: TradeState, mark: float) -> None:
+        """Keep the best and worst mark seen while live (MFE / MAE)."""
+        if trade.side == "Buy":
+            trade.mfe_price = mark if trade.mfe_price is None else max(trade.mfe_price, mark)
+            trade.mae_price = mark if trade.mae_price is None else min(trade.mae_price, mark)
+        else:
+            trade.mfe_price = mark if trade.mfe_price is None else min(trade.mfe_price, mark)
+            trade.mae_price = mark if trade.mae_price is None else max(trade.mae_price, mark)
+
+    @staticmethod
+    def _liq_inside_stop(trade: TradeState) -> Optional[str]:
+        """
+        Alarm text if the exchange's liquidation price sits at or inside the
+        stop — the sizing cushion failed (tier change, hedge mode, manual
+        leverage). Fires once per trade.
+        """
+        if not trade.liq_price or not trade.stop_loss or trade.liq_warned:
+            return None
+        sl = float(trade.stop_loss)
+        inside = trade.liq_price >= sl if trade.side == "Buy" else trade.liq_price <= sl
+        if not inside:
+            return None
+        trade.liq_warned = True
+        return (f"⚠ {trade.symbol}: liquidation {trade.liq_price:g} sits inside the stop "
+                f"{sl:g} — the cushion failed. Lower leverage or tighten the stop.")
+
     def _get_open_orders_all(self, symbol: Optional[str] = None) -> List[dict]:
         """Return all open linear orders, following Bybit pagination."""
         orders: List[dict] = []
@@ -370,6 +555,10 @@ class TradingCore:
             return
         trade.risk_usd = intent.get("risk_usd") or trade.risk_usd
         trade.opened_at = intent.get("opened_at") or trade.opened_at
+        if intent.get("mfe"):
+            trade.mfe_price = float(intent["mfe"])
+        if intent.get("mae"):
+            trade.mae_price = float(intent["mae"])
         if not intent.get("strat1"):
             return
         tp, sl, ep = intent.get("tp"), intent.get("sl"), intent.get("entry_price")
@@ -425,6 +614,8 @@ class TradingCore:
                 trade.leaves_qty = "0"
                 trade.leverage = pos.get("leverage", "")
                 trade.position_value = float(pos.get("positionValue", "0")) or None
+                liq = pos.get("liqPrice", "")
+                trade.liq_price = float(liq) if liq and float(liq) > 0 else None
                 tp_val = pos.get("takeProfit", "")
                 sl_val = pos.get("stopLoss", "")
                 trade.take_profit = tp_val if tp_val and tp_val != "0" else None
@@ -608,14 +799,20 @@ class TradingCore:
             self.log(f"fee rate sync failed (using config defaults): {e}", is_error=True)
 
     def _handle_wallet_event(self, message: dict) -> None:
-        """Private wallet stream → live equity (pushes on fills/funding/transfers)."""
+        """Private wallet stream → live equity + available (pushes on fills/funding/transfers)."""
         for acct in message.get("data", []):
             te = acct.get("totalEquity", "")
+            av = acct.get("totalAvailableBalance", "")
             if te:
                 try:
-                    self._on_balance(float(te))
+                    self._on_balance(float(te), float(av) if av else None)
                 except ValueError:
                     pass
+
+    @property
+    def ratchet(self) -> List[tuple]:
+        """The Strat1 ratchet table [(progress, lock_r), …] in effect."""
+        return list(self._ratchet)
 
     def _handle_execution_event(self, message: dict) -> None:
         """
@@ -700,7 +897,8 @@ class TradingCore:
         # Merge into the price cache (deltas only carry changed fields).
         with self._lock:
             cached = self._last_ticker.setdefault(symbol, {})
-            for k in ("lastPrice", "markPrice", "bid1Price", "ask1Price"):
+            for k in ("lastPrice", "markPrice", "bid1Price", "ask1Price",
+                      "fundingRate", "nextFundingTime"):
                 v = data.get(k)
                 if v:
                     cached[k] = v
@@ -719,6 +917,7 @@ class TradingCore:
                     TradeState.PHASE_LIVE,
                 ):
                     trade.mark_price = mark
+                    self._track_excursion(trade, mark)
                     if trade.fill_price and trade.qty:
                         qty = float(trade.qty)
                         if trade.side == "Buy":
@@ -727,8 +926,8 @@ class TradingCore:
                             trade.unrealised_pnl = (trade.fill_price - mark) * qty
                     snapshot = trade.clone()
 
-                    # ── Strat1: Smart trailing SL ─────────────────
-                    if trade.strat1_enabled and trade.strat1_phase < 2:
+                    # ── Strat1: ratchet the stop ──────────────────
+                    if trade.strat1_enabled and trade.strat1_phase < len(self._ratchet):
                         strat1_snapshot = self._evaluate_strat1(trade, mark)
                     break
 
@@ -739,84 +938,80 @@ class TradingCore:
 
     def _evaluate_strat1(self, trade: TradeState, mark: float) -> Optional[TradeState]:
         """
-        Strat1 smart trailing: auto-tighten SL based on progress toward TP.
+        Strat1 ratchet: move the stop as price progresses along the entry → TP
+        journey, per the STRAT1_RATCHET table (default 75% → -0.5R, 90% →
+        fee-adjusted break-even). The phase is the number of steps applied; a
+        fast move can skip intermediate steps. The stop only ever moves in the
+        trade's favour, and never past the mark (that would be a market exit).
+        Rate-limited to one amendment per 5 seconds per symbol.
 
-        75% of entry→TP journey: SL = entry ± (original_sl_distance / 2)
-        90% of entry→TP journey: SL = entry (breakeven)
-
-        Rate-limited to max 1 amendment per 5 seconds per symbol.
-        Returns a clone if SL was amended, otherwise None.
-
-        Note: Caller must hold self._lock.
+        Returns a clone if an amendment was dispatched, otherwise None.
+        Note: caller must hold self._lock.
         """
         entry = trade.fill_price
         tp = trade.original_tp
         sl_dist = trade.original_sl_distance
+        steps = self._ratchet
 
-        if not entry or not tp or not sl_dist or tp == entry:
-            return
+        if not entry or not tp or not sl_dist or tp == entry or trade.strat1_phase >= len(steps):
+            return None
 
-        # Compute progress: 0 = at entry, 1 = at TP
+        # Progress: 0 = at entry, 1 = at TP
         if trade.side == "Buy":
             progress = (mark - entry) / (tp - entry)
         else:
             progress = (entry - mark) / (entry - tp)
 
-        if progress < 0.75:
-            return  # Not in territory yet
+        target_phase = trade.strat1_phase
+        for i, (threshold, _) in enumerate(steps):
+            if progress >= threshold:
+                target_phase = i + 1
+        if target_phase <= trade.strat1_phase:
+            return None
 
         # Rate limit: max 1 amend per 5s per symbol
         now = time.time()
-        last = self._strat1_last_amend.get(trade.symbol, 0)
-        if now - last < 5:
-            return
+        if now - self._strat1_last_amend.get(trade.symbol, 0) < 5:
+            return None
 
         rules = self.cache.get(trade.symbol)
         if not rules:
-            return
-        tick = rules["tickSize"]
+            return None
 
-        new_phase = trade.strat1_phase
-        new_sl = None
+        lock_r = steps[target_phase - 1][1]
+        new_sl = ratchet_price(entry, sl_dist, trade.side, lock_r)
+        long = trade.side == "Buy"
 
-        if progress >= 0.90 and trade.strat1_phase < 2:
-            # 90%+ → TRUE breakeven: offset SL just past entry to cover the
-            # round-trip fees (maker entry + taker market-SL exit), so a stop-out
-            # here nets ~0 instead of a small fee-sized loss.
-            if trade.side == "Buy":
-                new_sl = entry * (1 + config.FEE_MAKER) / (1 - config.FEE_TAKER)
-            else:
-                new_sl = entry * (1 - config.FEE_MAKER) / (1 + config.FEE_TAKER)
-            new_phase = 2
-            self.log(f"strat1 [{trade.symbol}]: 90% reached → SL to true breakeven ({new_sl:.6f})")
+        # Never loosen: a manually tightened stop already beyond the ratchet
+        # level just records the phase.
+        current = float(trade.stop_loss) if trade.stop_loss else None
+        if current is not None and ((long and current >= new_sl) or (not long and current <= new_sl)):
+            trade.strat1_phase = target_phase
+            return None
+        # Never cross the mark: a lock that sits past the current price would
+        # trigger immediately. Record the phase and say so once.
+        if (long and new_sl >= mark) or (not long and new_sl <= mark):
+            trade.strat1_phase = target_phase
+            self.log(f"strat1 [{trade.symbol}]: lock {lock_r:+.2f}R at {new_sl:.6g} is past the "
+                     f"mark {mark:.6g} — step skipped (check STRAT1_RATCHET vs your R:R)",
+                     is_error=True)
+            return None
 
-        elif progress >= 0.75 and trade.strat1_phase < 1:
-            # 75%+ → half the original SL distance from entry
-            if trade.side == "Buy":
-                new_sl = entry - (sl_dist / 2)
-            else:
-                new_sl = entry + (sl_dist / 2)
-            new_phase = 1
-            self.log(f"strat1 [{trade.symbol}]: 75% reached → SL tightened to {new_sl:.6f}")
-
-        if new_sl is not None:
-            str_sl = format_value(new_sl, tick)
-            old_phase = trade.strat1_phase
-            old_sl = trade.stop_loss
-            
-            # Update local state immediately to block redundant ticker triggers
-            trade.strat1_phase = new_phase
-            trade.stop_loss = str_sl
-            self._strat1_last_amend[trade.symbol] = now
-            
-            # Dispatch network call to the background worker thread queue
-            self._queue.put((
-                self._execute_strat1_amend,
-                (trade.symbol, str_sl, new_phase, trade.entry_order_id, old_phase, old_sl),
-                {}
-            ))
-            return trade.clone()
-        return None
+        str_sl = format_value(new_sl, rules["tickSize"])
+        old_phase, old_sl = trade.strat1_phase, trade.stop_loss
+        # Update local state immediately to block redundant ticker triggers
+        trade.strat1_phase = target_phase
+        trade.stop_loss = str_sl
+        self._strat1_last_amend[trade.symbol] = now
+        self.log(f"strat1 [{trade.symbol}]: {progress:.0%} of the way to TP → stop to {str_sl} "
+                 f"(locks {lock_r:+.2f}R)")
+        # Dispatch the REST amend to the background worker
+        self._queue.put((
+            self._execute_strat1_amend,
+            (trade.symbol, str_sl, target_phase, trade.entry_order_id, old_phase, old_sl),
+            {}
+        ))
+        return trade.clone()
 
     def _handle_order_event(self, message: dict) -> None:
         """
@@ -887,6 +1082,7 @@ class TradingCore:
                         need_ticker_sub = True
                     else:
                         trade.phase = TradeState.PHASE_CANCELLED
+                        trade.closed_at = time.time()
                         self.log(f"entry cancelled: {symbol}")
                     snapshot = trade.clone()
 
@@ -898,6 +1094,7 @@ class TradingCore:
                             TradeState.PHASE_LIVE,
                         ):
                             trade.phase = TradeState.PHASE_CLOSED
+                            trade.closed_at = time.time()
                             trade.close_type = stop_type
                             trade.close_price = float(order.get("avgPrice") or order.get("triggerPrice", 0))
                             self.log(f"trade closed: {symbol} via {stop_type} @ {trade.close_price}")
@@ -908,7 +1105,7 @@ class TradingCore:
                                 self._note_closing_order,
                                 (symbol, trade.entry_price or 0.0,
                                  trade.order_link_id, oid),
-                                {},
+                                {"mfe": trade.mfe_price, "mae": trade.mae_price},
                             ))
                             break
 
@@ -933,6 +1130,7 @@ class TradingCore:
             pos_value = pos.get("positionValue", "0")
 
             snapshot = None
+            liq_alarm = None
             with self._lock:
                 for trade in self._trades.values():
                     if trade.symbol != symbol:
@@ -947,13 +1145,29 @@ class TradingCore:
                         lev = pos.get("leverage", "")
                         if lev:
                             trade.leverage = lev
+                        liq = pos.get("liqPrice", "")
+                        if liq and liq != "0":
+                            try:
+                                trade.liq_price = float(liq)
+                            except ValueError:
+                                pass
+                        if trade.mark_price:
+                            self._track_excursion(trade, trade.mark_price)
+                        liq_alarm = self._liq_inside_stop(trade)
 
                         if size == 0:
                             trade.phase = TradeState.PHASE_CLOSED
+                            trade.closed_at = trade.closed_at or time.time()
                             trade.close_type = trade.close_type or "Position Closed"
                             trade.close_price = trade.mark_price
                             trade.pnl = self._compute_trade_pnl(trade)
                             self.log(f"position closed: {symbol}")
+                            # Journal the excursions (off-thread: disk write)
+                            self._queue.put((
+                                self._update_risk_intent,
+                                (symbol, trade.entry_price or 0.0, trade.order_link_id),
+                                {"mfe": trade.mfe_price, "mae": trade.mae_price},
+                            ))
 
                         snapshot = trade.clone()
                         break
@@ -965,6 +1179,8 @@ class TradingCore:
                         snapshot = trade.clone()
                         break
 
+            if liq_alarm:
+                self.log(liq_alarm, is_error=True)
             if snapshot:
                 self._on_trade_update(snapshot)
 
@@ -986,21 +1202,6 @@ class TradingCore:
             raise ValueError("SHORT: Stop Loss must be above Entry.")
 
         distance_pct = abs(entry - sl) / entry
-        max_exchange_lev = rules["maxLev"]
-
-        # Real per-symbol MMR from Bybit's risk limit API (base tier)
-        # e.g. BTC = 0.005 (0.5%), shitcoins may be 0.02 (2%)
-        mmr = rules.get("mmr", 0.005)
-        # Add a small cushion for taker fees + slippage (0.2%)
-        fee_cushion = 0.002
-        total_buffer = mmr + fee_cushion
-
-        # Safe leverage: ensures liquidation distance > SL distance
-        # liq_distance = initial_margin - mmr = (1/lev) - mmr
-        # We need: (1/lev) - mmr > sl_distance  →  lev < 1/(sl_distance + mmr)
-        safe_lev = math.floor(1.0 / (distance_pct + total_buffer))
-        target_lev = int(max(1, min(safe_lev, max_exchange_lev)))
-
         str_entry = format_value(entry, rules["tickSize"])
         str_sl = format_value(sl, rules["tickSize"])
 
@@ -1048,7 +1249,35 @@ class TradingCore:
 
         fee_usd = round(float(Decimal(str(str_qty)) * fee_per_unit), 2)
         notional_usd = round(float(str_qty) * entry, 2)
+
+        # Risk-limit tier for THIS notional. Bybit raises the maintenance margin
+        # rate (and lowers max leverage) in tiers as position value grows, so
+        # the base-tier MMR would overstate the liquidation distance on anything
+        # above tier 1 — which on most alts ends at $5k–$20k.
+        tier = InstrumentCache.tier_for(rules, notional_usd)
+        mmr = tier["mmr"]
+        max_exchange_lev = min(rules["maxLev"], tier["maxLev"] or rules["maxLev"])
+        # Add a small cushion for taker fees + slippage (0.2%)
+        fee_cushion = 0.002
+        total_buffer = mmr + fee_cushion
+
+        # Safe leverage: ensures liquidation distance > SL distance
+        # liq_distance = initial_margin - mmr = (1/lev) - mmr
+        # We need: (1/lev) - mmr > sl_distance  →  lev < 1/(sl_distance + mmr)
+        safe_lev = math.floor(1.0 / (distance_pct + total_buffer))
+        target_lev = int(max(1, min(safe_lev, max_exchange_lev)))
         margin_usd = round(notional_usd / target_lev, 2)
+
+        # Isolated-margin liquidation estimate (conservative, see docs §03),
+        # and the room left between it and the stop. By construction the
+        # cushion is ≥ fee_cushion; the exchange's own liqPrice replaces the
+        # estimate once the position is live and is checked against the stop.
+        if side == "Buy":
+            liq_price = entry * (1 - 1 / target_lev + mmr)
+            cushion = (sl - liq_price) / entry
+        else:
+            liq_price = entry * (1 + 1 / target_lev - mmr)
+            cushion = (liq_price - sl) / entry
 
         return {
             "symbol": symbol,
@@ -1065,7 +1294,13 @@ class TradingCore:
             "fee_usd": fee_usd,
             "tick_size": rules["tickSize"],
             "mmr_pct": round(mmr * 100, 3),
+            "base_mmr_pct": round(rules.get("mmr", mmr) * 100, 3),
             "buffer_pct": round(total_buffer * 100, 3),
+            "liq_price": liq_price,
+            "cushion_pct": round(cushion * 100, 3),
+            "tier": tier["index"] + 1,
+            "tier_count": tier["count"],
+            "tier_limit": tier["limit"],
         }
 
     # ─── Order Execution ──────────────────────────────────────────
@@ -1100,7 +1335,8 @@ class TradingCore:
         self.log(
             f"Calc: {symbol} {side} | Entry={calc['entry']} SL={calc['sl']} | "
             f"SL Dist={calc['sl_distance_pct']}% | Lev={target_lev}x/{calc['max_exchange_lev']}x | "
-            f"Qty={calc['qty']} | Notional=${calc['notional_usd']}"
+            f"Qty={calc['qty']} | Notional=${calc['notional_usd']} | "
+            f"Liq≈{calc['liq_price']:.6g} (tier {calc['tier']}, cushion {calc['cushion_pct']}%)"
         )
 
         # ── Step 0: Reject if already tracking a trade on this symbol ──
@@ -1182,6 +1418,8 @@ class TradingCore:
         trade.original_sl_distance = abs(entry - sl)
         trade.original_tp = tp
         trade.leverage = str(target_lev)
+        trade.liq_price = calc["liq_price"]
+        trade.tier = calc["tier"]
         trade.entry_qty = calc["qty"]
         trade.qty = calc["qty"]
         trade.stop_loss = calc["sl"]
@@ -1234,16 +1472,22 @@ class TradingCore:
         new_sl: Optional[float] = None,
     ) -> None:
         """
-        Amend TP/SL on an active trade.
+        Amend TP/SL on an active trade. Works on the core's own TradeState
+        (the GUI hands us a clone) so the next ticker snapshot carries the new
+        bracket instead of silently reverting it, and re-persists the target
+        so a restart restores Strat1 against the live TP.
 
         Phase A (PENDING):  amend the dormant metadata on the entry order.
         Phase B (LIVE):     find the spawned conditional orders and amend them.
         """
+        trade = self._resolve_core_trade(trade)
         rules = self.cache.get(trade.symbol)
         if not rules:
             raise ValueError("Symbol not in cache.")
 
         tick = rules["tickSize"]
+        applied_tp: Optional[str] = None
+        applied_sl: Optional[str] = None
 
         if trade.phase == TradeState.PHASE_PENDING:
             # ── Phase A: Entry hasn't filled yet ─────────────────
@@ -1259,8 +1503,10 @@ class TradingCore:
                 payload["takeProfit"] = str_trigger
                 payload["tpOrderType"] = "Limit"
                 payload["tpLimitPrice"] = str_tp
+                applied_tp = str_tp
             if new_sl is not None:
-                payload["stopLoss"] = format_value(new_sl, tick)
+                applied_sl = format_value(new_sl, tick)
+                payload["stopLoss"] = applied_sl
 
             self.client.amend_order(**payload)
             self.log(f"Amended dormant brackets on pending entry {trade.entry_order_id}")
@@ -1317,36 +1563,51 @@ class TradingCore:
                     slSize=pos_size,
                     positionIdx=0,
                 )
-                trade.take_profit = str_tp
-                trade.stop_loss = str_sl
+                applied_tp, applied_sl = str_tp, str_sl
                 self.log(f"TP/SL pair added → TP {str_tp} (trigger {str_trigger}) | SL {str_sl}")
-                return
+            else:
+                if wants_tp:
+                    str_tp = format_value(new_tp, tick)
+                    str_trigger = self._tp_trigger_price(trade.fill_price, new_tp, tick) if trade.fill_price else str_tp
+                    self.client.amend_order(
+                        category="linear",
+                        symbol=trade.symbol,
+                        orderId=tp_order["orderId"],
+                        triggerPrice=str_trigger,
+                        price=str_tp,
+                    )
+                    applied_tp = str_tp
+                    self.log(f"TP trailed → {str_tp} (trigger {str_trigger})")
 
-            if wants_tp:
-                str_tp = format_value(new_tp, tick)
-                str_trigger = self._tp_trigger_price(trade.fill_price, new_tp, tick) if trade.fill_price else str_tp
-                self.client.amend_order(
-                    category="linear",
-                    symbol=trade.symbol,
-                    orderId=tp_order["orderId"],
-                    triggerPrice=str_trigger,
-                    price=str_tp,
-                )
-                trade.take_profit = str_tp
-                self.log(f"TP trailed → {str_tp} (trigger {str_trigger})")
-
-            if wants_sl:
-                str_sl = format_value(new_sl, tick)
-                self.client.amend_order(
-                    category="linear",
-                    symbol=trade.symbol,
-                    orderId=sl_order["orderId"],
-                    triggerPrice=str_sl,
-                )
-                trade.stop_loss = str_sl
-                self.log(f"SL trailed → {str_sl}")
+                if wants_sl:
+                    str_sl = format_value(new_sl, tick)
+                    self.client.amend_order(
+                        category="linear",
+                        symbol=trade.symbol,
+                        orderId=sl_order["orderId"],
+                        triggerPrice=str_sl,
+                    )
+                    applied_sl = str_sl
+                    self.log(f"SL trailed → {str_sl}")
         else:
             raise ValueError(f"Trade is {trade.phase} — cannot modify.")
+
+        # Commit to the core's state and publish a snapshot
+        with self._lock:
+            if applied_tp is not None:
+                trade.take_profit = applied_tp
+                if trade.strat1_enabled:
+                    # The ratchet measures progress against the live target
+                    trade.original_tp = float(new_tp)
+            if applied_sl is not None:
+                trade.stop_loss = applied_sl
+            snapshot = trade.clone()
+            entry_ref = trade.entry_price or trade.fill_price or 0.0
+            link_id = trade.order_link_id
+        self._on_trade_update(snapshot)
+        if applied_tp is not None:
+            # The original stop stays the R basis, so only the target is re-persisted.
+            self._update_risk_intent(trade.symbol, entry_ref, link_id, tp=float(new_tp))
 
     # ─── Market Close (panic button) ──────────────────────────────
 
@@ -1358,6 +1619,7 @@ class TradingCore:
         zero; a best-effort sweep runs afterwards to cancel any leftovers so
         a stale conditional can never fire on a future position.
         """
+        trade = self._resolve_core_trade(trade)
         if trade.phase not in (TradeState.PHASE_PARTIAL, TradeState.PHASE_LIVE):
             raise ValueError("No live position to close.")
 
@@ -1380,22 +1642,13 @@ class TradingCore:
 
         closing_oid = response.get("result", {}).get("orderId", "")
         self._note_closing_order(trade.symbol, trade.entry_price or 0.0,
-                                 trade.order_link_id, closing_oid)
+                                 trade.order_link_id, closing_oid,
+                                 mfe=trade.mfe_price, mae=trade.mae_price)
 
-        # Label the close on the core's copy (the GUI may hand us a clone) so
-        # the position event finalises it as Manual instead of generic.
+        # Label the close so the position event finalises it as Manual
+        # instead of generic.
         with self._lock:
-            core_trade = self._trades.get(trade.entry_order_id)
-            if core_trade is None:
-                for t in self._trades.values():
-                    if t.symbol == trade.symbol and t.phase in (
-                        TradeState.PHASE_PARTIAL,
-                        TradeState.PHASE_LIVE,
-                    ):
-                        core_trade = t
-                        break
-            if core_trade:
-                core_trade.close_type = "Manual"
+            trade.close_type = "Manual"
 
         self.log(f"market close dispatched: {trade.symbol} qty {size}")
         self._queue.put((self._sweep_orphan_brackets, (trade.symbol,), {}))
@@ -1427,6 +1680,7 @@ class TradingCore:
 
     def cancel_trade(self, trade: TradeState) -> None:
         """Cancel a resting entry order. Partial fills keep the filled position live."""
+        trade = self._resolve_core_trade(trade)
         if trade.phase not in (TradeState.PHASE_PENDING, TradeState.PHASE_PARTIAL):
             raise ValueError("Can only cancel orders in PENDING or PARTIAL phase.")
 
@@ -1444,6 +1698,7 @@ class TradingCore:
                 self.log(f"Cancelled remaining entry {trade.entry_order_id}; live qty {trade.qty}")
             else:
                 trade.phase = TradeState.PHASE_CANCELLED
+                trade.closed_at = time.time()
                 self.log(f"Cancelled entry {trade.entry_order_id}")
             snapshot = trade.clone()
         self._on_trade_update(snapshot)
@@ -1479,17 +1734,29 @@ class TradingCore:
         """Compute the TP trigger at the midpoint between entry and TP (for maker fill)."""
         return format_value((entry + tp) / 2, tick)
 
-    def get_wallet_balance(self) -> Optional[float]:
-        """Return total account equity in USD for display."""
+    def get_wallet_snapshot(self) -> dict:
+        """{'equity', 'available'} for the UNIFIED account (None when unavailable)."""
         try:
             res = self.client.get_wallet_balance(accountType="UNIFIED")
             account = res["result"]["list"][0]
-            total_eq = account.get("totalEquity", "")
-            if total_eq:
-                return float(total_eq)
+            eq = account.get("totalEquity", "")
+            av = account.get("totalAvailableBalance", "")
+            if not av:
+                # Isolated-margin UTA leaves the account-level field empty;
+                # fall back to the settle coin's own available balance.
+                for coin in account.get("coin", []):
+                    if coin.get("coin") == "USDT":
+                        av = coin.get("availableToWithdraw") or coin.get("walletBalance") or ""
+                        break
+            return {"equity": float(eq) if eq else None,
+                    "available": float(av) if av else None}
         except Exception as e:
             self.log(f"Failed to get wallet balance: {e}", is_error=True)
-        return None
+        return {"equity": None, "available": None}
+
+    def get_wallet_balance(self) -> Optional[float]:
+        """Return total account equity in USD for display."""
+        return self.get_wallet_snapshot()["equity"]
 
     def _get_position_size(self, symbol: str) -> str:
         """Return current position size for a symbol (used by set_trading_stop)."""
@@ -1506,13 +1773,17 @@ class TradingCore:
     # ─── Risk ledger (for R-multiples on app-placed trades) ───────
 
     def _load_risk_ledger(self) -> List[dict]:
-        """Load the persisted risk ledger, pruning entries older than backfill."""
+        """
+        Load the persisted risk ledger, pruning entries older than
+        RISK_LEDGER_MAX_AGE_DAYS. (Pruning at the journal backfill window
+        silently killed Strat1 restore and R-multiples on holds > 30 days.)
+        """
         try:
             with open(config.RISK_LEDGER_FILE, "r") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             return []
-        cutoff = time.time() - config.JOURNAL_BACKFILL_DAYS * 86400
+        cutoff = time.time() - config.RISK_LEDGER_MAX_AGE_DAYS * 86400
         return [e for e in data if (e.get("ts") or 0) >= cutoff]
 
     def _save_risk_ledger(self) -> None:
@@ -1586,23 +1857,31 @@ class TradingCore:
         return None
 
     def _note_closing_order(self, symbol: str, entry_price: float,
-                            link_id: Optional[str], closing_oid: str) -> None:
+                            link_id: Optional[str], closing_oid: str,
+                            mfe: Optional[float] = None,
+                            mae: Optional[float] = None) -> None:
         """
         Tag the ledger entry with the exchange orderId that closed (or partly
         closed) the trade. Bybit's closed-PnL record carries the same orderId,
         so the journal join becomes an exact key lookup instead of a fuzzy
         price match — re-entering the same level can no longer steal a
-        different trade's risk intent.
+        different trade's risk intent. Also records the excursions so the
+        journal can carry MFE/MAE.
         """
         if not closing_oid:
             return
         with self._risk_ledger_lock:
             i = self._match_risk_intent_index(symbol, entry_price, link_id)
             if i >= 0:
-                ids = self._risk_ledger[i].setdefault("closing_order_ids", [])
+                entry = self._risk_ledger[i]
+                ids = entry.setdefault("closing_order_ids", [])
                 if closing_oid not in ids:
                     ids.append(closing_oid)
-                    self._save_risk_ledger()
+                if mfe is not None:
+                    entry["mfe"] = mfe
+                if mae is not None:
+                    entry["mae"] = mae
+                self._save_risk_ledger()
 
     def _peek_risk_intent(self, symbol: str, entry_price: float,
                           link_id: Optional[str] = None) -> Optional[dict]:
@@ -1611,13 +1890,20 @@ class TradingCore:
             i = self._match_risk_intent_index(symbol, entry_price, link_id)
             return dict(self._risk_ledger[i]) if i >= 0 else None
 
-    def _update_risk_intent_phase(self, symbol: str, entry_price: float,
-                                  link_id: Optional[str], phase: int) -> None:
-        """Persist strat1 phase progress so a restart re-arms at the right step."""
+    def _update_risk_intent(self, symbol: str, entry_price: float,
+                            link_id: Optional[str], **fields) -> None:
+        """
+        Persist fields on the matching ledger entry (strat1_phase so a restart
+        re-arms at the right step; tp after a manual change; mfe/mae for the
+        journal). None values are ignored.
+        """
+        fields = {k: v for k, v in fields.items() if v is not None}
+        if not fields:
+            return
         with self._risk_ledger_lock:
             i = self._match_risk_intent_index(symbol, entry_price, link_id)
             if i >= 0:
-                self._risk_ledger[i]["strat1_phase"] = phase
+                self._risk_ledger[i].update(fields)
                 self._save_risk_ledger()
 
     # ─── Journal reconciliation (Bybit closed-PnL = source of truth) ──
@@ -1675,13 +1961,18 @@ class TradingCore:
         pnl = float(r.get("closedPnl", "0") or 0)
         closed_at = (float(r.get("updatedTime", "0") or 0)) / 1000.0
 
-        # Derive the *position* side from the price move vs PnL sign — robust to
-        # whether Bybit's `side` field means the position or the closing order.
-        if exit_p != entry_p:
-            was_long = (exit_p > entry_p) == (pnl >= 0)
-            side = "Buy" if was_long else "Sell"
+        # Bybit's closed-PnL `side` is the CLOSING order's side (it sits among
+        # the order fields in the docs), so the position side is its opposite.
+        # The price-vs-PnL heuristic is only a fallback: it misreads
+        # near-breakeven exits — exactly what Strat1's break-even stop produces —
+        # because fees turn a tiny gross gain into a small net loss.
+        closing_side = r.get("side")
+        if closing_side in ("Buy", "Sell"):
+            side = "Sell" if closing_side == "Buy" else "Buy"
+        elif exit_p != entry_p:
+            side = "Buy" if (exit_p > entry_p) == (pnl >= 0) else "Sell"
         else:
-            side = "Buy" if r.get("side") == "Sell" else "Sell"
+            side = "Buy"
 
         return {
             "order_id": r.get("orderId", ""),
@@ -1695,6 +1986,8 @@ class TradingCore:
             "close_type": "closed",
             "strat1_used": False,
             "r_multiple": None,
+            "mfe_r": None,
+            "mae_r": None,
             "opened_at": None,
             "closed_at": closed_at,
             "duration_sec": None,
@@ -1720,3 +2013,12 @@ class TradingCore:
             entry["r_multiple"] = round(pnl / risk_usd, 2)
         if opened_at and entry.get("closed_at"):
             entry["duration_sec"] = int(entry["closed_at"] - opened_at)
+        # Excursions in R, against the original stop distance (price-based, no fees)
+        sl, ep = intent.get("sl"), intent.get("entry_price")
+        if sl and ep and abs(float(ep) - float(sl)) > 0:
+            dist = abs(float(ep) - float(sl))
+            long = entry.get("side") == "Buy"
+            for key, price in (("mfe_r", intent.get("mfe")), ("mae_r", intent.get("mae"))):
+                if price:
+                    move = (float(price) - float(ep)) if long else (float(ep) - float(price))
+                    entry[key] = round(move / dist, 2)

@@ -114,13 +114,48 @@ class TradeJournal:
         with self._lock:
             return len(self._trades)
 
-    def stats(self, session_only: bool = False) -> Dict[str, Any]:
-        """Compute summary statistics."""
+    def since(self, ts: float) -> List[Dict[str, Any]]:
+        """Trades closed at or after *ts* (epoch seconds), oldest first."""
+        with self._lock:
+            return [t for t in self._trades if (t.get("closed_at") or 0) >= ts]
+
+    def loss_streak(self) -> int:
+        """Consecutive losses ending at the latest close (flat trades are skipped)."""
+        with self._lock:
+            ordered = sorted(self._trades, key=lambda t: t.get("closed_at") or 0,
+                             reverse=True)
+        n = 0
+        for t in ordered:
+            pnl = t.get("pnl")
+            if pnl is None or pnl == 0:
+                continue
+            if pnl > 0:
+                break
+            n += 1
+        return n
+
+    def recent_symbols(self, n: int = 5) -> List[str]:
+        """Distinct symbols, most recently closed first."""
+        with self._lock:
+            ordered = sorted(self._trades, key=lambda t: t.get("closed_at") or 0,
+                             reverse=True)
+        out: List[str] = []
+        for t in ordered:
+            s = t.get("symbol")
+            if s and s not in out:
+                out.append(s)
+            if len(out) >= n:
+                break
+        return out
+
+    def stats(self, session_only: bool = False, since: float = 0) -> Dict[str, Any]:
+        """Summary statistics — lifetime, this session, or since a timestamp."""
         with self._lock:
             trades = list(self._trades)
         if session_only:
-            trades = [t for t in trades
-                      if (t.get("closed_at") or 0) >= self._session_start]
+            since = max(since or 0, self._session_start)
+        if since:
+            trades = [t for t in trades if (t.get("closed_at") or 0) >= since]
 
         if not trades:
             return {

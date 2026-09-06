@@ -57,3 +57,25 @@ JOURNAL_BACKFILL_DAYS: int = int(os.getenv("JOURNAL_BACKFILL_DAYS", "30"))
 RISK_LEDGER_FILE: str = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "risk_ledger.json"
 )
+
+# Ledger entries older than this are pruned on load. It must exceed your
+# longest hold: a live position whose entry is pruned loses its R-multiple
+# and its Strat1 restore after a restart.
+RISK_LEDGER_MAX_AGE_DAYS: int = int(os.getenv("RISK_LEDGER_MAX_AGE_DAYS", "365"))
+
+# ─── Risk governance (account level) ─────────────────────────────
+# Risk on one trade above this share of equity asks for a hard confirm.
+MAX_RISK_PCT: float = float(os.getenv("MAX_RISK_PCT", "2.0"))
+# Open risk (sum of $ at the stops across active trades) above this share of
+# equity asks for a confirm before adding another trade.
+MAX_OPEN_RISK_PCT: float = float(os.getenv("MAX_OPEN_RISK_PCT", "6.0"))
+# Realised loss today at which the terminal stops taking new trades. 0 = off.
+DAILY_LOSS_LIMIT_USD: float = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
+# Consecutive losses at which a new trade asks for a confirm. 0 = off.
+LOSS_STREAK_CONFIRM: int = int(os.getenv("LOSS_STREAK_CONFIRM", "3"))
+
+# ─── Strat1 ratchet ───────────────────────────────────────────────
+# "progress:lockR, …" — at ≥ progress of the entry→TP journey, move the stop
+# to lock lockR (in original stop distances): -0.5 = half the stop still at
+# risk, 0 = fee-adjusted break-even, +0.5 = break-even plus half an R.
+STRAT1_RATCHET: str = os.getenv("STRAT1_RATCHET", "0.75:-0.5,0.90:0")
