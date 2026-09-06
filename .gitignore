@@ -33,3 +33,7 @@ bybit_symbology.json
 trade_journal.json
 trade_journal.json.corrupted
 risk_ledger.json
+
+# Local app bundle + generated icon (machine-specific paths)
+Viridis.app/
+assets/

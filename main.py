@@ -9,11 +9,12 @@ Usage:
     python main.py
 """
 
+import os
 import sys
 import threading
 import time
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QStringListModel, QTimer
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtGui import QColor, QIcon, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit,
@@ -1658,6 +1659,19 @@ class JournalDialog(QDialog):
 
 def main():
     app = QApplication(sys.argv)
+
+    # Dock/window icon (present locally via the Viridis.app bundle; optional)
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "assets", "icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        try:
+            # Qt's windowIcon doesn't reach the macOS Dock — set it natively.
+            from AppKit import NSApplication, NSImage
+            NSApplication.sharedApplication().setApplicationIconImage_(
+                NSImage.alloc().initWithContentsOfFile_(icon_path))
+        except ImportError:
+            pass
 
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(BG))
