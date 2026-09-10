@@ -717,9 +717,10 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
         mmr = rules.get("mmr", 0.005) * 100
+        max_lev, tick_s, step_s = f"{int(rules['maxLev'])}x", rules["tickSize"], rules["qtyStep"]
         self.info_label.setText(
-            f"max {span(f'{int(rules['maxLev'])}x', T.TEXT)} &nbsp;·&nbsp; tick {span(rules['tickSize'], T.TEXT)}"
-            f" &nbsp;·&nbsp; step {span(rules['qtyStep'], T.TEXT)} &nbsp;·&nbsp; "
+            f"max {span(max_lev, T.TEXT)} &nbsp;·&nbsp; tick {span(tick_s, T.TEXT)}"
+            f" &nbsp;·&nbsp; step {span(step_s, T.TEXT)} &nbsp;·&nbsp; "
             f"mmr {span(f'{mmr:.2f}%', T.TEXT)}{limit_s}{fund}"
         )
 
@@ -947,18 +948,20 @@ class MainWindow(QMainWindow):
         def v(s):
             return span(s, T.TEXT, weight=500)
 
+        lev_s = f" &nbsp;·&nbsp; {calc['leverage']}x &nbsp;·&nbsp; qty "
+        fee_s = f"${calc['fee_usd']:.2f}"
+        cushion_s = f"{calc['cushion_pct']:.2f}%"
         l1 = (f"{span(symbol, T.WHITE, 12, 600)} {span(('long' if long else 'short') + ' @', T.TEXT_DIM)} "
-              f"{span(fmt_px(entry, tick), T.TEXT, 12)}"
-              f"{span(f' &nbsp;·&nbsp; {calc['leverage']}x &nbsp;·&nbsp; qty ', T.TEXT_DIM)}{v(calc['qty'])}")
+              f"{span(fmt_px(entry, tick), T.TEXT, 12)}{span(lev_s, T.TEXT_DIM)}{v(calc['qty'])}")
         l2 = (f"notional {v(fmt_usd(calc['notional_usd'], 0, signed=False))} · "
               f"margin {v(fmt_usd(calc['margin_usd'], 2, signed=False))}"
               + (f" · {calc['margin_usd'] / avail * 100:.1f}% of avail" if avail else ""))
-        l3 = f"risk {v(fmt_usd(risk, 2, signed=False))} incl {v(f'${calc['fee_usd']:.2f}')} fees"
+        l3 = f"risk {v(fmt_usd(risk, 2, signed=False))} incl {v(fee_s)} fees"
         if eq:
             l3 += f" · {v(f'{risk / eq * 100:.1f}%')} eq"
         l3 += f" · rr {v(f'1:{rr:.2f}')}" if rr else f" · {v('no target')}"
         tier = (f" · tier {calc['tier']}/{calc['tier_count']}" if calc["tier_count"] > 1 else "")
-        l4 = (f"liq {v(fmt_px(calc['liq_price'], tick))} · cushion {v(f'{calc['cushion_pct']:.2f}%')}"
+        l4 = (f"liq {v(fmt_px(calc['liq_price'], tick))} · cushion {v(cushion_s)}"
               f" · mmr {calc['mmr_pct']:.2f}%{tier}")
         self.preview_label.setText(
             f"<span style='color:{T.TEXT_DIM}'>{l1}<br>{l2}<br>{l3}<br>{l4}</span>"

@@ -1,117 +1,121 @@
-# Viridis — Bybit Execution Engine
+# Viridis
 
-A risk-first execution terminal for Bybit USDT perpetuals. Define your risk, and the engine handles position sizing, leverage, and bracket management — all through a single atomic API call.
+A desktop terminal for trading Bybit USDT perpetuals where the only number you decide is how much you are willing to lose.
 
-## Core Concept
+You type an entry, a stop and a dollar risk. Viridis sizes the position, picks the leverage that keeps liquidation behind your stop, and sends the entry with its take-profit and stop-loss as one order. It then watches the trade, ratchets the stop if you ask it to, and journals the result with the exchange's own numbers.
 
-```
-Input:   LONG BTC @ $74,300 | SL $73,300 | Risk $50
+![The Viridis board](docs/board.png)
 
-Engine:  SL distance   = $1,000 / $74,300 = 1.35%
-         Safe leverage  = floor(1 / (1.35% + MMR + fees)) = 48x
-         Qty            = $50 / ($1,000 + fees) ≈ 0.047 BTC   (risk is net of fees)
-         Margin locked  = $3,492 / 48 = $72.75
-         Liquidation    ≈ $73,124 — 0.23% behind the stop, and checked against
-                          the exchange's own liqPrice once the position is live
+*Ticket on the left, one card per open trade on the right, account-level risk in the top bar. Synthetic data.*
 
-Result:  If wrong → lose $50. If right → keep the profit.
-```
+## Why it exists
 
-Position size is derived from **risk**, not margin. Leverage is computed to keep liquidation behind your stop — never manually set — using the risk-limit tier the trade's notional actually lands in.
+Every exchange ticket asks for a size and a leverage. Neither is something you know. What you know is where you enter, where you are wrong, and what that mistake may cost you. The size follows from those three numbers once fees are included, and the leverage follows from the exchange's maintenance-margin rules. Viridis does that arithmetic on every keystroke and shows it on a price ladder, so the trade you see is the trade that gets sent.
 
-## The board
+## A trade, start to finish
 
-Ticket on the left, positions on the right, account-level risk in the top bar.
+1. **Fill the ticket.** Symbol, entry, a stop as a price or a distance (`-0.8%`), an optional target as a price, a percent (`+3%`) or a multiple of the stop distance (`2R`), and the risk in dollars or as a share of equity (`1%`). Arrow keys nudge prices by one tick.
+2. **Read the preview.** It recomputes as you type: quantity, leverage, margin, fees, reward-to-risk, the estimated liquidation price and the cushion between it and your stop. Warnings appear ranked: amber ones ask for a confirmation, red ones block.
+3. **Send.** ⌘Enter opens a confirm sheet with the same numbers and warnings. One API call places a limit entry carrying a limit take-profit and a market stop-loss that triggers on mark price. Post-only is on by default: a limit that would cross the book is cancelled instead of filling as taker.
+4. **Manage.** The trade becomes a card: mark price, PnL in dollars and R, a mini ladder with the liquidation price, the best and worst the trade has been, and the buttons that matter: stop to break-even, stop to −0.5R, edit target or stop, cancel, close at market.
+5. **Review.** When the trade closes, the journal takes Bybit's closed-PnL record, which is fee-inclusive, and attaches the R-multiple plus maximum favourable and adverse excursion. The strip at the bottom shows today, the last seven days and lifetime.
 
-- **Live preview** — recomputes on every keystroke: leverage, quantity, notional, margin, fees, R:R, liquidation and cushion. Execute is never available without the numbers on screen, and warnings are ranked (amber confirms, red blocks).
-- **Relative inputs** — the stop takes a price or a distance (`-0.8%`), the target a price, a percent (`+3%`) or an R multiple (`2R`), and risk dollars or a share of equity (`1%`). Arrow keys nudge by tick (shift ×10), Enter moves on, ⌘Enter executes, Esc resets.
-- **Price ladder** — target, mark, entry, stop and liquidation on one scale with the distance, the dollars and the R at each level.
-- **Position cards** — severity stripe, a mini ladder with liquidation and MFE, the cushion behind the stop, MFE/MAE in R, strat1 progress, and inline actions: stop to break-even, stop to −0.5R, close at market, cancel, edit TP/SL (relative syntax works here too).
-- **Governance strip** — open risk in dollars and as a share of equity, today's realised PnL against a daily limit, and the loss streak. Caps are `.env` settings; a breached daily limit blocks new trades.
-- **Stats strip + log drawer** — today, 7 days and lifetime with an R histogram and an equity curve; the log collapses to one line and opens itself on errors.
-
-## Engine
-
-- **Atomic OTOCO brackets** — Entry + TP (limit) + SL (market) in one API call via `tpslMode="Partial"`
-- **Tier-aware MMR** — All risk-limit tiers are cached; sizing uses the maintenance margin rate and max leverage of the tier the notional lands in, so the liquidation cushion holds on alts where tier 1 ends at $5k–$20k
-- **Liquidation check** — The exchange's `liqPrice` is tracked per position and compared to the stop; if it ever sits inside, the log shouts
-- **Strat1 ratchet** — De-risking stop moves as price progresses toward the target, from a configurable table (`STRAT1_RATCHET`, default 75% → −0.5R, 90% → fee-adjusted break-even). Never loosens, never crosses the mark, survives restarts via the risk ledger
-- **Fee-aware risk sizing** — "risk" is the net loss at the stop including round-trip fees
-- **Honest connection status** — The status pill polls actual WebSocket state and degrades visibly to the 30s REST fallback
-- **Execution-stream truth** — Every fill is checked against the maker-entry assumption; taker fills are flagged with actual vs planned fees
-- **Account-synced fee rates** — Maker/taker rates are pulled from Bybit at boot
-- **Trade journal** — Mirrors Bybit's closed-PnL history (fee-inclusive, source of truth), deduped by closing order ID, so it captures trades closed while the app was off. App-placed trades carry R, MFE and MAE
-- **Margin mode control** — Toggle isolated/cross from the top bar (needs a flat account)
-- **Instrument cache** — 700+ symbols cached to disk (24h TTL), with autocomplete search
-
-## Architecture
+## The arithmetic, once
 
 ```
-Bybit/
-├── config.py             .env loader → typed constants (fees, triggers, governance caps, ratchet)
-├── cache_engine.py       Instrument + risk-limit tier cache (auto-paginated, 24h TTL)
-├── trading_core.py       Risk math, OTOCO execution, WebSocket state machine, Strat1, ledger
-├── journal.py            Exchange-mirrored trade journal (Bybit closed-PnL) + stats
-├── theme.py              Palette + stylesheet
-├── widgets.py            Painted primitives: ladder, mini ladder, charts, hinted input, meter
-├── views.py              Trade card, journal dialog, text formatting
-├── main.py               PyQt6 window: ticket, board, governance strip, drawer
-├── tests/                Unit tests: risk math, tiers, ratchet, reconciliation (python -m unittest discover -s tests)
-├── test_trade.py         CLI dry run through the engine, optional fire
-├── docs/                 Architecture & design guide (HTML, diagrams)
-├── bybit_symbology.json  Auto-generated instrument cache
-└── trade_journal.json    Permanent local trade archive
+LONG BTC · entry 74,300 · stop 73,300 · risk $50
+
+stop distance   1,000 / 74,300                      = 1.35 %
+quantity        50 / (1,000 + fees per unit)        = 0.047 BTC     risk is net of fees
+tier            $3,492 of notional sits in tier 1   → MMR 0.33 %, max 150x
+leverage        floor(1 / (1.35 % + 0.33 % + 0.2 %)) = 53x
+liquidation     74,300 × (1 − 1/53 + 0.33 %)        ≈ 73,143       0.21 % behind the stop
+margin locked   3,492 / 53                          = $65.89
 ```
 
-**Signal flow:** `TradingCore` (background threads) → `SignalBridge` (Qt signals) → `MainWindow` (main thread). Every exchange call lives in the core, including the 30-second REST reconciliation and the journal sync; the window holds snapshots, renders them, and hands them back for actions.
+Leverage is a capital-efficiency knob, not a risk knob: the loss at the stop is $50 at 10x and at 53x. Once the position is live, the exchange's own liquidation price replaces the estimate, and the log shouts if it ever sits inside the stop.
 
-## Documentation
+## What keeps you out of trouble
 
-A deeper, diagram-rich guide lives in [`docs/`](docs/index.html) — open `docs/index.html` in a browser:
+- **Caps.** Risk above 2% of equity on one trade asks for a hard confirm. Open risk above 6% of equity after the trade asks for a confirm. A daily loss limit, if you set one, blocks new trades for the day. Three losses in a row add a warning.
+- **Blocks.** Margin above available balance, a second trade on a symbol that already has one, and a breached daily limit disable the send button.
+- **Tier-aware sizing.** Bybit raises the maintenance margin rate as position value grows. On most alts tier 1 ends at $5k–$20k of notional, so the base rate would put liquidation inside the stop. Viridis uses the tier the trade actually lands in.
+- **Strat1.** An optional stop ratchet: at 75% of the way to the target the stop moves to −0.5R, at 90% to fee-adjusted break-even. The table is configurable, the stop never loosens, and it survives restarts.
+- **Honest status.** The status pill reflects the real WebSocket state and falls back to REST polling every 30 seconds when a stream drops.
 
-- **[Architecture & design guide](docs/index.html)** — philosophy, the risk math (with worked examples), order execution, the concurrency model, trade lifecycle, Strat1, and the board.
-- **[How the journal stays complete](docs/journal-sync.html)** — why the local journal is a permanent archive and Bybit is only used to fetch the delta.
+## Install and run
 
-## Quick Start
+Python 3.10 or newer, a Bybit Unified Trading Account in one-way mode, and an API key with contract order and position permissions.
 
 ```bash
-cp .env.example .env          # Add your Bybit API key + secret
+git clone https://github.com/seyeint/ViridisBybit.git && cd ViridisBybit
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env            # add BYBIT_API_KEY and BYBIT_API_SECRET
 python -m unittest discover -s tests
 python main.py
 ```
 
-## Trade Lifecycle
+Set `BYBIT_TESTNET=true` in `.env` to run against testnet first; the window shows a badge when it is on. `python test_trade.py` prices a fixed trade through the engine, prints the exact order body, and fires only if you type `FIRE`.
 
-```mermaid
-flowchart LR
-    A["PENDING"] -->|entry fills| B["LIVE"]
-    A -->|partial fill| P["PARTIAL"]
-    P -->|remaining entry fills| B
-    P -->|remaining entry cancelled| B
-    A -->|cancelled| C["CANCELLED"]
-    B -->|TP hit| D["CLOSED ✅"]
-    B -->|SL hit| E["CLOSED ❌"]
-    B -->|market close| F["CLOSED (manual)"]
-    B -->|amend| B
+| Key | Action |
+|---|---|
+| ↩ | Next field; from the risk field, send |
+| ⌘↩ | Send from anywhere |
+| ↑ ↓ | Nudge a price by one tick, ⇧ for ten; steps a % or R input |
+| Esc | Reset the ticket |
+
+## Configuration
+
+Everything lives in `.env`. Defaults are sensible for a VIP0 account; the fee rates are replaced by your real tier at boot.
+
+| Key | Default | What it does |
+|---|---|---|
+| `BYBIT_API_KEY`, `BYBIT_API_SECRET` | | Credentials |
+| `BYBIT_TESTNET` | `false` | Use testnet |
+| `DEFAULT_RISK_USD` | `100` | Seeds the risk field |
+| `MAX_RISK_PCT` | `2.0` | Per-trade risk above this share of equity needs a hard confirm |
+| `MAX_OPEN_RISK_PCT` | `6.0` | Open risk above this share of equity needs a confirm |
+| `DAILY_LOSS_LIMIT_USD` | `0` | Realised loss today at which sending is disabled; 0 turns it off |
+| `LOSS_STREAK_CONFIRM` | `3` | Consecutive losses at which a new trade warns; 0 turns it off |
+| `STRAT1_RATCHET` | `0.75:-0.5,0.90:0` | Strat1 steps as `progress:lockR` pairs |
+| `SL_TRIGGER_BY` | `MarkPrice` | Stop trigger reference; liquidation uses mark, so keep it |
+| `FEE_MAKER_RATE`, `FEE_TAKER_RATE` | `0.0002`, `0.00055` | Fallback fee rates |
+| `JOURNAL_BACKFILL_DAYS` | `30` | History pulled the first time the journal is empty |
+| `RISK_LEDGER_MAX_AGE_DAYS` | `365` | Keep above your longest hold |
+
+## How it is built
+
+```
+trading_core.py   the engine: risk math, order execution, stream handlers, Strat1,
+                  risk ledger, journal reconciliation — the only file that talks to Bybit
+cache_engine.py   instrument rules and risk-limit tiers, cached to disk for a day
+journal.py        closed trades mirrored from the exchange, plus statistics
+main.py           the window: ticket, board, governance strip, log drawer
+views.py          trade card, journal dialog, text formatting
+widgets.py        painted primitives: ladder, mini ladder, charts, hinted input
+theme.py          palette and stylesheet
+config.py         .env → typed constants
+tests/            unit tests for the math, the ratchet and the reconciliation paths
+docs/             a longer design guide with diagrams — open docs/index.html
 ```
 
-Bracket modifications use `amend_order` for existing child conditionals. `set_trading_stop` is only used to add a fresh paired `Partial` TP/SL with equal sizes.
+The core runs on background threads and is the single writer of trade state. The window receives snapshots through Qt signals, renders them, and hands them back for actions. Three files on disk are yours and git-ignored: `bybit_symbology.json` (the cache), `trade_journal.json` (every closed trade, append-only) and `risk_ledger.json` (intended risk and Strat1 state per app-placed trade).
 
-## Design Decisions
+## Decisions worth knowing
 
-| Decision | Rationale |
+| Decision | Why |
 |---|---|
-| `tpslMode="Partial"` | TP as limit order (not market). Matching engine handles OCO natively. Keeps multi-TP scale-out optionality. |
-| Tier-aware MMR | Bybit raises MMR with position value. On most alts tier 1 ends below a $100-risk trade's notional; the base rate would put liquidation inside the stop. |
-| 0.2% leverage cushion | Keeps liquidation behind your SL even after SL-fill slippage; verified against the exchange's liqPrice once live. |
-| SL triggers on Mark Price | Liquidation always uses Mark Price; triggering the SL on the same reference guarantees the SL fires *before* liquidation. Configurable via `SL_TRIGGER_BY`. |
-| Fee-aware risk sizing | "Risk" = your *net* loss when stopped (price move + round-trip fees), and it holds regardless of leverage. |
-| Account-level caps | Per-trade risk, open risk and a daily loss limit live in the top bar and gate execution — risk-first has to hold across trades, not just inside one. |
-| Exchange-mirrored journal | Reconciled from Bybit closed-PnL, so it captures trades closed while the app was off; fees included; deduped by order ID; side taken from the closing order. |
-| TP trigger at midpoint | `(entry + tp) / 2` — triggers the limit TP order early enough for maker fill. |
-| TP trigger on Last Price | A limit fill needs the *traded* market to reach the trigger; Mark can deviate exactly when it matters. (SL stays on Mark — see above.) |
-| Post-only by default | Sizing assumes a maker entry. A marketable limit stays possible — but deliberate, never accidental. The execution stream verifies the assumption after every fill. |
-| Closing-orderId journal join | R-multiples join on the exact closing order ID (recorded as brackets fire); fuzzy entry-price match only for external closes. |
-| Fee rates synced from account | `get_fee_rates` at boot overrides config, so sizing tracks the real fee tier without manual updates. |
+| Risk is net of fees | The loss at the stop includes the maker entry and the taker exit; a naive size overshoots by 7% at a 1% stop and 37% at a 0.2% stop. |
+| Stop triggers on mark price | Liquidation is evaluated on mark. Triggering the stop on the same reference is what makes the cushion a guarantee. |
+| Take-profit is a limit order triggered at the midpoint | It rests on the book before price arrives and fills as maker. |
+| One bracket per order, `tpslMode="Partial"` | The exchange handles the one-cancels-other logic, and partial mode keeps scale-outs possible later. |
+| Post-only by default | Sizing assumes a maker entry. A taker fill stays possible, but deliberate. |
+| Journal mirrors the exchange | Trades closed while the app was off are still captured, and PnL is Bybit's fee-inclusive number rather than an estimate. |
+| Account-level caps | Risk-first has to hold across trades, not only inside one. |
+
+Not built yet: scaling out at several targets, and closing half a position. Both need the bracket resized in the same step and deserve their own design.
+
+## Status
+
+A personal tool that trades real money. It has unit tests for the arithmetic and the reconciliation paths and has been run against a live account, but there is no warranty of any kind. Read the code before you trust it with yours.
