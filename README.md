@@ -17,7 +17,7 @@ Every exchange ticket asks for a size and a leverage. Neither is something you k
 1. **Fill the ticket.** Symbol, entry, a stop as a price or a distance (`-0.8%`), an optional target as a price, a percent (`+3%`) or a multiple of the stop distance (`2R`), and the risk in dollars or as a share of equity (`1%`). Arrow keys nudge prices by one tick.
 2. **Read the preview.** It recomputes as you type: quantity, leverage, margin, fees, reward-to-risk, the estimated liquidation price and the cushion between it and your stop. Warnings appear ranked: amber ones ask for a confirmation, red ones block.
 3. **Send.** ⌘Enter opens a confirm sheet with the same numbers and warnings. One API call places a limit entry carrying a limit take-profit and a market stop-loss that triggers on mark price. Post-only is on by default: a limit that would cross the book is cancelled instead of filling as taker.
-4. **Manage.** The trade becomes a card: mark price, PnL in dollars and R, a mini ladder with the liquidation price, the best and worst the trade has been, and the buttons that matter: stop to break-even, stop to −0.5R, edit target or stop, cancel, close at market.
+4. **Manage.** The trade becomes a card: entry, mark, PnL in dollars and R, and a mini ladder with the stop, the target and the liquidation price. Click it and the details unfold, leverage, quantity, cushion, best and worst excursion, with the buttons that matter: stop to break-even, stop to −0.5R, edit target or stop, cancel, close at market. Hover any card for the same numbers.
 5. **Review.** When the trade closes, the journal takes Bybit's closed-PnL record, which is fee-inclusive, and attaches the R-multiple plus maximum favourable and adverse excursion. The strip at the bottom shows today, the last seven days and lifetime.
 
 ## The arithmetic, once
@@ -79,6 +79,7 @@ Everything lives in `.env`. Defaults are sensible for a VIP0 account; the fee ra
 | `DAILY_LOSS_LIMIT_USD` | `0` | Realised loss today at which sending is disabled; 0 turns it off |
 | `LOSS_STREAK_CONFIRM` | `3` | Consecutive losses at which a new trade warns; 0 turns it off |
 | `STRAT1_RATCHET` | `0.75:-0.5,0.90:0` | Strat1 steps as `progress:lockR` pairs |
+| `LIQ_CUSHION_PCT` | `0.2` | Room between the stop and the liquidation price, % of entry; widen it on thin alts, it only costs margin |
 | `SL_TRIGGER_BY` | `MarkPrice` | Stop trigger reference; liquidation uses mark, so keep it |
 | `FEE_MAKER_RATE`, `FEE_TAKER_RATE` | `0.0002`, `0.00055` | Fallback fee rates |
 | `JOURNAL_BACKFILL_DAYS` | `30` | History pulled the first time the journal is empty |

@@ -96,9 +96,11 @@ def local_midnight() -> float:
 
 class TradeCard(QFrame):
     """
-    One active trade: header, mini ladder, stats line, inline actions.
-    Reports through `on_select(key)` and `on_action(key, action, payload)`;
-    actions are "be", "half", "close", "cancel" and "apply" (payload: tp/sl text).
+    One active trade. At rest: a header line and the mini ladder. Selected
+    (clicked): the detail line and the action buttons unfold; the same
+    details show as a tooltip on hover. Reports through `on_select(key)` and
+    `on_action(key, action, payload)`; actions are "be", "half", "close",
+    "cancel" and "apply" (payload: tp/sl text).
     """
 
     def __init__(self, key: str, on_select: Callable[[str], None],
@@ -107,6 +109,7 @@ class TradeCard(QFrame):
         self.key = key
         self._on_select = on_select
         self._on_action = on_action
+        self._expanded = False
         self.setObjectName("card")
         self.setProperty("stripe", "dim")
         self.setProperty("selected", False)
@@ -123,12 +126,15 @@ class TradeCard(QFrame):
         self.mini = MiniLadder()
         lay.addWidget(self.mini)
 
-        self.stats = QLabel("")
-        self.stats.setTextFormat(Qt.TextFormat.RichText)
-        self.stats.setWordWrap(True)
-        lay.addWidget(self.stats)
+        self.details = QLabel("")
+        self.details.setTextFormat(Qt.TextFormat.RichText)
+        self.details.setWordWrap(True)
+        self.details.hide()
+        lay.addWidget(self.details)
 
-        acts = QHBoxLayout()
+        self.actions = QWidget()
+        acts = QHBoxLayout(self.actions)
+        acts.setContentsMargins(0, 0, 0, 0)
         acts.setSpacing(6)
         self.btn_be = self._act("sl → be", "be")
         self.btn_half = self._act("sl → −0.5R", "half")
@@ -139,7 +145,8 @@ class TradeCard(QFrame):
         for b in self._buttons:
             acts.addWidget(b)
         acts.addStretch()
-        lay.addLayout(acts)
+        self.actions.hide()
+        lay.addWidget(self.actions)
 
         self.edit_row = QWidget()
         er = QHBoxLayout(self.edit_row)
@@ -198,9 +205,16 @@ class TradeCard(QFrame):
         self.update()
 
     def set_selected(self, on: bool) -> None:
+        """Selection is also expansion: only the selected card shows details and actions."""
         if bool(self.property("selected")) != on:
             self.setProperty("selected", on)
             self._repolish()
+        if self._expanded != on:
+            self._expanded = on
+            self.details.setVisible(on)
+            self.actions.setVisible(on)
+            if not on:
+                self.hide_edit()
 
     def set_busy(self, on: bool) -> None:
         for b in self._buttons:
@@ -240,28 +254,25 @@ class TradeCard(QFrame):
         def dim(s):
             return span(s, T.TEXT_DIM)
 
-        sym = span(t.symbol, T.WHITE, 12, 600)
-        side_pill = span("LONG" if long else "SHORT", T.POSITIVE if long else T.NEGATIVE, 9, 600)
-        phase_pill = span(t.phase.lower(), T.ACCENT if live else T.TEXT_DIM, 9, 600)
-        head = f"{sym}&nbsp;&nbsp;{side_pill}&nbsp;&nbsp;{phase_pill}&nbsp;&nbsp;&nbsp;"
+        def v(s):
+            return span(s, T.TEXT, weight=500)
+
+        # ── Header: the glance ──
+        head = (f"{span(t.symbol, T.WHITE, 12, 600)}&nbsp;&nbsp;"
+                f"{span('LONG' if long else 'SHORT', T.POSITIVE if long else T.NEGATIVE, 9, 600)}")
+        if t.phase != TradeState.PHASE_LIVE:
+            head += f"&nbsp;&nbsp;{span(t.phase.lower(), T.TEXT_DIM, 9, 600)}"
         right = ""
         if live:
-            head += f"{dim('@')} {px(entry)} {dim('· mark')} {px(mark)}"
+            head += f"&nbsp;&nbsp;&nbsp;{px(entry)} {dim('→')} {px(mark)}"
             if t.phase == TradeState.PHASE_PARTIAL:
                 head += dim(f" · {t.cum_exec_qty or '?'}/{t.entry_qty or '?'} filled")
             if pnl is not None:
-                col = T.POSITIVE if pnl >= 0 else T.NEGATIVE
-                extras = []
+                right = span(fmt_usd(pnl), T.POSITIVE if pnl >= 0 else T.NEGATIVE, 12, 600)
                 if risk:
-                    extras.append(fmt_r(pnl / risk))
-                if tp and entry and mark and tp != entry:
-                    prog = (mark - entry) / (tp - entry) if long else (entry - mark) / (entry - tp)
-                    extras.append(f"{prog * 100:.0f}% to tp")
-                right = span(fmt_usd(pnl), col, 12, 600)
-                if extras:
-                    right += "&nbsp;&nbsp;" + span(" · ".join(extras), T.TEXT_DIM, 10)
+                    right += "&nbsp;&nbsp;" + span(fmt_r(pnl / risk), T.TEXT_DIM, 10)
         else:
-            head += f"{dim('resting')} {px(entry)}"
+            head += f"&nbsp;&nbsp;&nbsp;{dim('resting')} {px(entry)}"
             ref = (ticker or {}).get("ask1Price" if long else "bid1Price")
             if ref and entry:
                 gap = abs(float(ref) - entry) / entry
@@ -274,9 +285,7 @@ class TradeCard(QFrame):
 
         self.mini.set_levels(entry, sl, tp, liq, mark, t.mfe_price if live else None)
 
-        def v(s):
-            return span(s, T.TEXT, weight=500)
-
+        # ── Details: unfold on click, tooltip on hover ──
         parts = [f"lev {v((t.leverage or '--') + 'x')}",
                  f"qty {v(t.qty or t.entry_qty or '--')}",
                  f"tp {v(px(tp))}", f"sl {v(px(sl))}"]
@@ -285,6 +294,9 @@ class TradeCard(QFrame):
             ccol = T.NEGATIVE if cushion <= 0 else (T.AMBER if cushion < 0.001 else T.TEXT)
             parts.append(f"liq {v(px(liq))} · {span(f'{cushion * 100:.2f}%', ccol, weight=500)} behind sl"
                          + (" (est)" if liq_est else ""))
+        if live and tp and entry and mark and tp != entry:
+            prog = (mark - entry) / (tp - entry) if long else (entry - mark) / (entry - tp)
+            parts.append(f"{v(f'{prog * 100:.0f}%')} of the way to tp")
         if live and dist and entry:
             if t.mfe_price:
                 r = (t.mfe_price - entry) / dist if long else (entry - t.mfe_price) / dist
@@ -307,10 +319,11 @@ class TradeCard(QFrame):
             if tp and entry and dist:
                 parts.append(f"rr {v(f'1:{abs(tp - entry) / dist:.2f}')}")
         elif t.opened_at:
-            parts.append(age_str(t.opened_at))
+            parts.append(f"open {age_str(t.opened_at)}")
         # Items wrap as a whole, never in the middle of "mae −0.22R".
         parts = [p.replace(" ", "&nbsp;") for p in parts]
-        self.stats.setText(span(" &nbsp;· ".join(parts), T.TEXT_DIM, 10.5))
+        self.details.setText(span(" &nbsp;· ".join(parts), T.TEXT_DIM, 10.5))
+        self.setToolTip("<span style='font-size:11px;'>" + "<br>".join(parts) + "</span>")
 
         for b in (self.btn_be, self.btn_half, self.btn_close):
             b.setVisible(live)

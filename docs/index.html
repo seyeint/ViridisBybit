@@ -114,6 +114,16 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
     <code>liqPrice</code> is tracked and compared to the stop; if it ever sits inside, the log shouts.</p>
   </div>
   <div class="callout info">
+    <h3>What the cushion is for</h3>
+    <p>The stop and the liquidation are both evaluated on mark price, so the stop always triggers first;
+    volatility on the way down cannot reorder them. The cushion (<code>LIQ_CUSHION_PCT</code>, 0.2% by
+    default, plus whatever the integer leverage rounding adds) is the room for the stop's <em>market order</em>
+    to fill before mark can travel on to the liquidation price. It only fails if a single mark step exceeds
+    it during those milliseconds — a flash crash on a major, a cascade on a thin alt. Widening it costs
+    margin and nothing else: on the BTC example 0.5% means 45× instead of 53×, about $12 more locked for
+    the same $50 at risk.</p>
+  </div>
+  <div class="callout info">
     <h3>Why a Mark-Price stop trigger?</h3>
     <p>Liquidation is <em>always</em> evaluated on <strong>Mark Price</strong>. If your stop triggered on
     Last Price, your cushion would be measured between two different rulers — and Last vs Mark diverge
@@ -275,6 +285,7 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
     <tr><td><code>DEFAULT_RISK_USD</code></td><td><code>100</code></td><td>Default net-loss risk per trade.</td></tr>
     <tr><td><code>FEE_MAKER_RATE</code></td><td><code>0.0002</code></td><td>Maker fee (limit fills) — used in sizing, break-even, journal.</td></tr>
     <tr><td><code>FEE_TAKER_RATE</code></td><td><code>0.00055</code></td><td>Taker fee (market stop / fills).</td></tr>
+    <tr><td><code>LIQ_CUSHION_PCT</code></td><td><code>0.2</code></td><td>Room between the stop and the liquidation price, in % of entry. A latency buffer for the stop's market order, not a volatility buffer; widen it on thin alts.</td></tr>
     <tr><td><code>SL_TRIGGER_BY</code></td><td><code>MarkPrice</code></td><td>Stop trigger reference (<code>MarkPrice</code> or <code>LastPrice</code>).</td></tr>
     <tr><td><code>JOURNAL_BACKFILL_DAYS</code></td><td><code>30</code></td><td>Cold-start history backfill window.</td></tr>
     <tr><td><code>RISK_LEDGER_MAX_AGE_DAYS</code></td><td><code>365</code></td><td>Ledger entries older than this are pruned. Keep it above your longest hold, or a restart loses Strat1 and R on that trade.</td></tr>
@@ -310,11 +321,13 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
     the dollars at that level and the R. The cushion between liquidation and stop is visible, not implied.</li>
   </ul>
   <h3>Cards</h3>
-  <p>One per active trade: a severity stripe, a mini ladder with liquidation and the max favourable excursion,
-  the cushion behind the stop (exchange-reported once live, estimated before), MFE/MAE in R, Strat1 phase and
-  next step, and inline actions — stop to break-even, stop to −0.5R, close at market, cancel, edit TP/SL.
-  Actions resolve to the core's own trade object, so the next ticker snapshot carries the change instead of
-  reverting it. A stop that would trigger immediately is refused before it is sent.</p>
+  <p>One per active trade. At rest a card is a header — symbol, side, entry → mark, PnL in $ and R — over a
+  mini ladder with stop, target and liquidation. Clicking a card unfolds its details (leverage, quantity, the
+  cushion behind the stop, progress to target, MFE/MAE in R, Strat1 phase, a taker-entry flag) and its
+  actions — stop to break-even, stop to −0.5R, close at market, cancel, edit TP/SL; only one card is
+  unfolded at a time, and hovering any card shows the same numbers as a tooltip. Actions resolve to the
+  core's own trade object, so the next ticker snapshot carries the change instead of reverting it. A stop
+  that would trigger immediately is refused before it is sent.</p>
   <h3>Governance strip</h3>
   <p>Open risk (sum of dollars at the stops across active trades, derived from the bracket for positions the
   app did not place), today's realised PnL against the daily limit, and the loss streak. The caps are

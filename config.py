@@ -33,6 +33,12 @@ DEFAULT_RISK_USD: float = float(os.getenv("DEFAULT_RISK_USD", "100.0"))
 FEE_MAKER: float = float(os.getenv("FEE_MAKER_RATE", "0.0002"))   # 0.02%
 FEE_TAKER: float = float(os.getenv("FEE_TAKER_RATE", "0.00055"))  # 0.055%
 
+# Room left between the stop and the liquidation price, in % of entry. Both
+# read mark price, so the stop always triggers first; this is the room for
+# its market order to fill before mark can reach the liquidation price. It
+# only costs margin: widen it on thin alts.
+LIQ_CUSHION_PCT: float = float(os.getenv("LIQ_CUSHION_PCT", "0.2"))
+
 # Price reference that fires the Stop Loss. Liquidation always uses MarkPrice,
 # so triggering the SL on MarkPrice guarantees the SL fires before liquidation
 # (the leverage cushion remains the room for the market SL to fill). Set to

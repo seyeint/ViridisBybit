@@ -1285,9 +1285,10 @@ class TradingCore:
         tier = InstrumentCache.tier_for(rules, notional_usd)
         mmr = tier["mmr"]
         max_exchange_lev = min(rules["maxLev"], tier["maxLev"] or rules["maxLev"])
-        # Add a small cushion for taker fees + slippage (0.2%)
-        fee_cushion = 0.002
-        total_buffer = mmr + fee_cushion
+        # The cushion is a latency buffer, not a volatility one: the stop and
+        # the liquidation both read mark price, so the stop triggers first,
+        # and this is the room for its market order to fill.
+        total_buffer = mmr + config.LIQ_CUSHION_PCT / 100
 
         # Safe leverage: ensures liquidation distance > SL distance
         # liq_distance = initial_margin - mmr = (1/lev) - mmr
@@ -1298,8 +1299,8 @@ class TradingCore:
 
         # Isolated-margin liquidation estimate (conservative, see docs §03),
         # and the room left between it and the stop. By construction the
-        # cushion is ≥ fee_cushion; the exchange's own liqPrice replaces the
-        # estimate once the position is live and is checked against the stop.
+        # cushion is ≥ LIQ_CUSHION_PCT; the exchange's own liqPrice replaces
+        # the estimate once the position is live and is checked against the stop.
         if side == "Buy":
             liq_price = entry * (1 - 1 / target_lev + mmr)
             cushion = (sl - liq_price) / entry

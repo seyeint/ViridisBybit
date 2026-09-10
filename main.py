@@ -409,7 +409,7 @@ class MainWindow(QMainWindow):
         self.board_count.setStyleSheet(f"font-size: 9px; letter-spacing: 1.5px; color: {T.TEXT_DIM};")
         head.addWidget(self.board_count)
         head.addStretch()
-        hint = QLabel("click a card to select · actions act on that card")
+        hint = QLabel("click a card for its details and actions · hover for the numbers")
         hint.setStyleSheet(f"font-size: 10px; color: {T.TEXT_MUTED};")
         head.addWidget(hint)
         lay.addLayout(head)
