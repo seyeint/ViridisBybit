@@ -21,30 +21,32 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 from PyQt6.QtCore import QEvent, QObject, QSettings, QStringListModel, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontMetrics, QIcon, QKeySequence, QPalette, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QCompleter, QDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QCompleter, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 import config
 import theme as T
 from cache_engine import InstrumentCache
-from journal import TradeJournal
 from trading_core import (
     TradeState, TradingCore, breakeven_price, format_value, parse_pct, parse_r,
     ratchet_price, resolve_risk, resolve_stop, resolve_target,
 )
-from widgets import EquityCurve, HintLineEdit, Ladder, Meter, MiniLadder, RHistogram
+from views import (
+    JournalDialog, TradeCard, countdown_str, fmt_pct, fmt_px, fmt_r, fmt_usd,
+    local_midnight, span,
+)
+from widgets import EquityCurve, HintLineEdit, Ladder, Meter, RHistogram
 
 
 # ──────────────────────────────────────────────────────────────────
-#  Signal bridge (WebSocket thread → Qt main thread)
+#  Signal bridge (core threads → Qt main thread)
 # ──────────────────────────────────────────────────────────────────
 
 class SignalBridge(QObject):
@@ -52,308 +54,22 @@ class SignalBridge(QObject):
     trade_signal = pyqtSignal(object)
     cache_done = pyqtSignal(int)
     margin_mode_sync = pyqtSignal(str)
-    margin_mode_warning = pyqtSignal(str)
     status_signal = pyqtSignal(str, str)
     balance_signal = pyqtSignal(float, object)      # equity, available | None
     execute_done = pyqtSignal(object, str)
     action_done = pyqtSignal(str, str, str)         # card key, action, error
-    positions_synced = pyqtSignal(dict, dict)
     journal_updated = pyqtSignal()
 
 
-# ──────────────────────────────────────────────────────────────────
-#  Formatting helpers
-# ──────────────────────────────────────────────────────────────────
-
-ACTIVE_PHASES = (TradeState.PHASE_PENDING, TradeState.PHASE_PARTIAL, TradeState.PHASE_LIVE)
-LIVE_PHASES = (TradeState.PHASE_PARTIAL, TradeState.PHASE_LIVE)
-
-
-def fmt_px(value: Optional[float], tick: Optional[str]) -> str:
-    """Price at tick precision with thousands separators."""
-    if value is None:
-        return "--"
-    if not tick:
-        return f"{value:,.6g}"
-    s = format_value(value, tick)
-    if "." in s:
-        whole, frac = s.split(".")
-        return f"{int(whole):,}.{frac}"
-    return f"{int(s):,}"
-
-
-def fmt_usd(value: float, decimals: int = 2, signed: bool = True) -> str:
-    sign = "−" if value < 0 else ("+" if signed else "")
-    return f"{sign}${abs(value):,.{decimals}f}"
-
-
-def fmt_pct(value: float, decimals: int = 2) -> str:
-    sign = "−" if value < 0 else "+"
-    return f"{sign}{abs(value) * 100:.{decimals}f}%"
-
-
-def fmt_r(value: float) -> str:
-    sign = "−" if value < 0 else "+"
-    return f"{sign}{abs(value):.2f}R"
-
-
-def span(text, color: str, size: Optional[float] = None, weight: Optional[int] = None) -> str:
-    style = f"color:{color};"
-    if size:
-        style += f" font-size:{size}px;"
-    if weight:
-        style += f" font-weight:{weight};"
-    return f"<span style='{style}'>{text}</span>"
-
-
-def local_midnight() -> float:
-    now = datetime.now()
-    return datetime(now.year, now.month, now.day).timestamp()
-
-
-def age_str(opened_at: Optional[float]) -> str:
-    if not opened_at:
-        return ""
-    d = max(0, time.time() - opened_at)
-    if d < 3600:
-        return f"{int(d // 60)}m"
-    if d < 86400:
-        return f"{int(d // 3600)}h {int(d % 3600 // 60)}m"
-    return f"{int(d // 86400)}d {int(d % 86400 // 3600)}h"
-
-
-def countdown_str(next_ms) -> str:
-    try:
-        d = float(next_ms) / 1000.0 - time.time()
-    except (TypeError, ValueError):
-        return ""
-    if d <= 0:
-        return "now"
-    return f"{int(d // 3600)}h {int(d % 3600 // 60):02d}m"
-
-
-# ──────────────────────────────────────────────────────────────────
-#  Trade card
-# ──────────────────────────────────────────────────────────────────
-
-class TradeCard(QFrame):
-    """One active trade: header, mini ladder, stats line, inline actions."""
-
-    def __init__(self, key: str, window: "MainWindow"):
-        super().__init__()
-        self.key = key
-        self._win = window
-        self.setObjectName("card")
-        self.setProperty("stripe", "dim")
-        self.setProperty("selected", False)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 9, 12, 9)
-        lay.setSpacing(6)
-
-        self.line1 = QLabel("")
-        self.line1.setTextFormat(Qt.TextFormat.RichText)
-        lay.addWidget(self.line1)
-
-        self.mini = MiniLadder()
-        lay.addWidget(self.mini)
-
-        self.stats = QLabel("")
-        self.stats.setTextFormat(Qt.TextFormat.RichText)
-        self.stats.setWordWrap(True)
-        lay.addWidget(self.stats)
-
-        acts = QHBoxLayout()
-        acts.setSpacing(6)
-        self.btn_be = self._act("sl → be", "be")
-        self.btn_half = self._act("sl → −0.5R", "half")
-        self.btn_close = self._act("close mkt", "close", "danger")
-        self.btn_cancel = self._act("cancel order", "cancel", "danger")
-        self.btn_edit = self._act("edit tp / sl", "edit", "primary")
-        for b in (self.btn_be, self.btn_half, self.btn_close, self.btn_cancel, self.btn_edit):
-            acts.addWidget(b)
-        acts.addStretch()
-        lay.addLayout(acts)
-
-        self.edit_row = QWidget()
-        er = QHBoxLayout(self.edit_row)
-        er.setContentsMargins(0, 0, 0, 0)
-        er.setSpacing(6)
-        self.edit_tp = QLineEdit()
-        self.edit_sl = QLineEdit()
-        for lbl, edit in (("tp", self.edit_tp), ("sl", self.edit_sl)):
-            edit.setObjectName("card_edit")
-            edit.setFixedWidth(120)
-            edit.setPlaceholderText("price · % · R")
-            l = QLabel(lbl)
-            l.setObjectName("dim")
-            er.addWidget(l)
-            er.addWidget(edit)
-        er.addWidget(self._act("apply", "apply", "primary"))
-        er.addStretch()
-        self.edit_row.hide()
-        lay.addWidget(self.edit_row)
-
-        self._buttons = [self.btn_be, self.btn_half, self.btn_close, self.btn_cancel, self.btn_edit]
-
-    def _act(self, text: str, action: str, kind: Optional[str] = None) -> QPushButton:
-        b = QPushButton(text)
-        b.setObjectName("act")
-        if kind:
-            b.setProperty("kind", kind)
-        b.setCursor(Qt.CursorShape.PointingHandCursor)
-        b.clicked.connect(lambda _=False, a=action: self._on_action(a))
-        return b
-
-    def _on_action(self, action: str) -> None:
-        self._win._select_card(self.key)
-        if action == "edit":
-            show = not self.edit_row.isVisible()
-            self.edit_row.setVisible(show)
-            self.btn_edit.setText("cancel edit" if show else "edit tp / sl")
-            if show:
-                self.edit_tp.setFocus()
-            return
-        if action == "apply":
-            self._win._card_action(self.key, "apply",
-                                   {"tp": self.edit_tp.text(), "sl": self.edit_sl.text()})
-            return
-        self._win._card_action(self.key, action)
-
-    def hide_edit(self) -> None:
-        self.edit_row.hide()
-        self.btn_edit.setText("edit tp / sl")
-        self.edit_tp.clear()
-        self.edit_sl.clear()
-
-    def mousePressEvent(self, event) -> None:
-        self._win._select_card(self.key)
-        super().mousePressEvent(event)
-
-    def _repolish(self) -> None:
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.update()
-
-    def set_selected(self, on: bool) -> None:
-        if bool(self.property("selected")) != on:
-            self.setProperty("selected", on)
-            self._repolish()
-
-    def set_busy(self, on: bool) -> None:
-        for b in self._buttons:
-            b.setEnabled(not on)
-
-    def update_from(self, t: TradeState, rules: Optional[dict], risk: Optional[float],
-                    ratchet: list) -> None:
-        tick = rules["tickSize"] if rules else None
-        long = t.side == "Buy"
-        live = t.phase in LIVE_PHASES
-        entry = t.fill_price or t.entry_price
-        sl = float(t.stop_loss) if t.stop_loss else None
-        tp = float(t.take_profit) if t.take_profit else None
-        mark = t.mark_price if live else None
-        liq = t.liq_price
-        liq_est = False
-        if liq is None and entry and t.leverage and rules:
-            try:
-                lev = float(t.leverage)
-                qty = float(t.qty or t.entry_qty or 0)
-                mmr = InstrumentCache.tier_for(rules, entry * qty)["mmr"]
-                liq = entry * (1 - 1 / lev + mmr) if long else entry * (1 + 1 / lev - mmr)
-                liq_est = True
-            except (TypeError, ValueError, ZeroDivisionError):
-                liq = None
-        dist = t.original_sl_distance or (abs(entry - sl) if entry and sl else None)
-        pnl = t.unrealised_pnl if live else None
-
-        stripe = "dim" if pnl is None else ("pos" if pnl >= 0 else "neg")
-        if self.property("stripe") != stripe:
-            self.setProperty("stripe", stripe)
-            self._repolish()
-
-        def px(v):
-            return fmt_px(v, tick) if v is not None else "--"
-
-        def dim(s):
-            return span(s, T.TEXT_DIM)
-
-        sym = span(t.symbol, T.WHITE, 12, 600)
-        side_pill = span("LONG" if long else "SHORT", T.POSITIVE if long else T.NEGATIVE, 9, 600)
-        phase_pill = span(t.phase.lower(), T.ACCENT if live else T.TEXT_DIM, 9, 600)
-        head = f"{sym}&nbsp;&nbsp;{side_pill}&nbsp;&nbsp;{phase_pill}&nbsp;&nbsp;&nbsp;"
-        right = ""
-        if live:
-            head += f"{dim('@')} {px(entry)} {dim('· mark')} {px(mark)}"
-            if t.phase == TradeState.PHASE_PARTIAL:
-                head += dim(f" · {t.cum_exec_qty or '?'}/{t.entry_qty or '?'} filled")
-            if pnl is not None:
-                col = T.POSITIVE if pnl >= 0 else T.NEGATIVE
-                extras = []
-                if risk:
-                    extras.append(fmt_r(pnl / risk))
-                if tp and entry and mark and tp != entry:
-                    prog = (mark - entry) / (tp - entry) if long else (entry - mark) / (entry - tp)
-                    extras.append(f"{prog * 100:.0f}% to tp")
-                right = span(fmt_usd(pnl), col, 12, 600)
-                if extras:
-                    right += "&nbsp;&nbsp;" + span(" · ".join(extras), T.TEXT_DIM, 10)
-        else:
-            head += f"{dim('resting')} {px(entry)}"
-            if t.phase == TradeState.PHASE_PENDING:
-                tk = self._win._core.get_ticker(t.symbol)
-                ref = tk.get("ask1Price") if long else tk.get("bid1Price")
-                if ref and entry:
-                    gap = (float(ref) - entry) / entry if long else (entry - float(ref)) / entry
-                    head += dim(f" · {abs(gap) * 100:.2f}% {'below the ask' if long else 'above the bid'}")
-            right = span(age_str(t.opened_at), T.TEXT_DIM, 10)
-        self.line1.setText(
-            f"<table width='100%' cellspacing='0' cellpadding='0'><tr>"
-            f"<td>{head}</td><td align='right'>{right}</td></tr></table>"
-        )
-
-        self.mini.set_levels(entry, sl, tp, liq, mark, t.mfe_price if live else None)
-
-        def v(s):
-            return span(s, T.TEXT, weight=500)
-
-        parts = [f"lev {v((t.leverage or '--') + 'x')}",
-                 f"qty {v(t.qty or t.entry_qty or '--')}",
-                 f"tp {v(px(tp))}", f"sl {v(px(sl))}"]
-        if liq and entry and sl:
-            cushion = (sl - liq) / entry if long else (liq - sl) / entry
-            ccol = T.NEGATIVE if cushion <= 0 else (T.AMBER if cushion < 0.001 else T.TEXT)
-            parts.append(f"liq {v(px(liq))} · {span(f'{cushion * 100:.2f}%', ccol, weight=500)} behind sl"
-                         + (" (est)" if liq_est else ""))
-        if live and dist and entry:
-            if t.mfe_price:
-                r = (t.mfe_price - entry) / dist if long else (entry - t.mfe_price) / dist
-                parts.append(f"mfe {span(fmt_r(r), T.POSITIVE)}")
-            if t.mae_price:
-                r = (t.mae_price - entry) / dist if long else (entry - t.mae_price) / dist
-                parts.append(f"mae {span(fmt_r(r), T.NEGATIVE)}")
-        if t.strat1_enabled:
-            n = len(ratchet)
-            if t.strat1_phase >= n:
-                parts.append(f"strat1 {v('done')}")
-            else:
-                nxt = ratchet[t.strat1_phase]
-                parts.append(f"strat1 {v(f'{t.strat1_phase}/{n}')} · next at {nxt[0] * 100:.0f}% "
-                             f"locks {nxt[1]:+.1f}R")
-        if not live:
-            parts.append(f"risk {v(fmt_usd(risk, 0, signed=False) if risk else '?')}")
-            if tp and entry and dist:
-                parts.append(f"rr {v(f'1:{abs(tp - entry) / dist:.2f}')}")
-        elif t.opened_at:
-            parts.append(age_str(t.opened_at))
-        # Items wrap as a whole, never in the middle of "mae −0.22R".
-        parts = [p.replace(" ", "&nbsp;") for p in parts]
-        self.stats.setText(span(" &nbsp;· ".join(parts), T.TEXT_DIM, 10.5))
-
-        for b in (self.btn_be, self.btn_half, self.btn_close):
-            b.setVisible(live)
-        self.btn_cancel.setVisible(t.phase in (TradeState.PHASE_PENDING, TradeState.PHASE_PARTIAL))
+class Ticket(NamedTuple):
+    """A resolved ticket: what calculate_trade and execute_bracket take."""
+    symbol: str
+    side: str
+    entry: float
+    sl: float
+    tp: Optional[float]
+    risk: float
+    rules: dict
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -374,24 +90,22 @@ class MainWindow(QMainWindow):
         self._bridge.trade_signal.connect(self._on_trade_state_changed)
         self._bridge.cache_done.connect(self._on_cache_refreshed)
         self._bridge.margin_mode_sync.connect(self._on_margin_mode_sync)
-        self._bridge.margin_mode_warning.connect(self._on_margin_mode_warning)
         self._bridge.status_signal.connect(self._on_status_updated)
         self._bridge.balance_signal.connect(self._on_balance_updated)
         self._bridge.execute_done.connect(self._on_execute_done)
         self._bridge.action_done.connect(self._on_action_done)
-        self._bridge.positions_synced.connect(self._on_positions_synced)
         self._bridge.journal_updated.connect(self._on_journal_updated)
 
         self._trades: Dict[str, TradeState] = {}      # key → latest snapshot
         self._cards: Dict[str, TradeCard] = {}
         self._selected_key: Optional[str] = None
-        self._journal = TradeJournal()
         self._journal_dialog = None
-        self._reconcile_lock = threading.Lock()
         self._is_long = True
         self._equity: Optional[float] = None
         self._available: Optional[float] = None
         self._tick_running = False
+        self._cache_ready = False
+        self._chips_state: Optional[list] = None
         self._log_count = 0
         self._drawer_open = False
         self._last_price_seen: Optional[str] = None
@@ -402,12 +116,17 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
+        # Core callbacks arrive on whichever thread produced them; the bridge
+        # queues them onto the Qt thread.
         self._core = TradingCore(
-            on_log=lambda msg, err: self._bridge.log_signal.emit(msg, err),
-            on_trade_update=lambda t: self._bridge.trade_signal.emit(t),
-            on_cache_complete=lambda count: self._bridge.cache_done.emit(count),
-            on_balance=lambda eq, av: self._bridge.balance_signal.emit(eq, av),
+            on_log=self._bridge.log_signal.emit,
+            on_trade_update=self._bridge.trade_signal.emit,
+            on_cache_complete=self._bridge.cache_done.emit,
+            on_balance=self._bridge.balance_signal.emit,
+            on_margin_mode=self._bridge.margin_mode_sync.emit,
+            on_journal=self._bridge.journal_updated.emit,
         )
+        self._journal = self._core.journal
 
         self._setup_autocomplete()
         geo = self._settings.value("geometry")
@@ -811,8 +530,11 @@ class MainWindow(QMainWindow):
         self.symbol_input.setPlaceholderText("BTC" if enabled else "loading symbology...")
         self._schedule_preview()
 
+    def _usdt_symbols(self) -> List[str]:
+        return [s for s in self._core.cache.symbols if s.endswith("USDT") and "-" not in s]
+
     def _setup_autocomplete(self):
-        symbols = [s for s in self._core.cache.symbols if s.endswith("USDT") and "-" not in s]
+        symbols = self._usdt_symbols()
         self._completer_model = QStringListModel(symbols)
         self._completer = QCompleter()
         self._completer.setModel(self._completer_model)
@@ -828,38 +550,24 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────
 
     def _post_boot(self):
-        snap = self._core.get_wallet_snapshot()
-        if snap["equity"] is not None:
-            self._on_balance_updated(snap["equity"], snap["available"])
-
-        synced = self._core.sync_existing()
-        for t in synced:
-            self._trades[t.entry_order_id] = t
-
+        # Account and positions synchronously: the first frame should be right.
+        self._core.refresh_account()
+        for t in self._core.sync_existing():
+            self._trades[t.entry_order_id] = t.clone()
         self._update_trade_panel()
         self._update_governance()
         self._update_stats_strip()
         self._refresh_chips()
 
-        def _get_margin_boot():
-            try:
-                mode = self._core.get_account_margin_mode()
-                self._core.account_margin_mode = mode
-                self._bridge.margin_mode_sync.emit(mode)
-            except Exception:
-                pass
-            self._core.sync_fee_rates()
-        threading.Thread(target=_get_margin_boot, daemon=True).start()
+        # Fee tier and the journal backfill are network: off the UI thread.
+        threading.Thread(target=self._run_logged, args=(self._core.sync_fee_rates,), daemon=True).start()
+        threading.Thread(target=self._run_logged, args=(self._core.reconcile_journal,), daemon=True).start()
 
         self._core.connect_websocket()
 
-        # Reconcile the journal against Bybit's closed-PnL history (captures
-        # trades closed while the app was off). Off the UI thread — it's network.
-        threading.Thread(target=self._reconcile_journal, daemon=True).start()
-
-        # Slow fallback poll (30s) — detects external closes + refreshes balance.
+        # Slow REST fallback (30s): account, positions, journal.
         self._tick_timer = QTimer()
-        self._tick_timer.timeout.connect(self._tick_positions)
+        self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(30_000)
 
         # UI refresh throttle (500ms max) — the ticker must not repaint
@@ -912,46 +620,24 @@ class MainWindow(QMainWindow):
     #  Position tick (slow poll)
     # ─────────────────────────────────────────────────────────────
 
-    def _tick_positions(self):
-        """Slow poll (30s): sync position state, detect external closes, refresh balance."""
+    def _run_logged(self, *steps):
+        """Run core steps on the calling (background) thread; failures go to the log, not the thread."""
+        for step in steps:
+            try:
+                step()
+            except Exception as e:
+                self._bridge.log_signal.emit(f"{step.__name__.replace('_', ' ')} failed: {e}", True)
+
+    def _tick(self):
+        """Slow REST fallback (30s). The core updates its own state and emits snapshots."""
         if self._tick_running:
             return
         self._tick_running = True
 
         def _do():
             try:
-                try:
-                    mode = self._core.get_account_margin_mode()
-                    if mode != self._core.account_margin_mode:
-                        self._core.account_margin_mode = mode
-                        self._bridge.margin_mode_sync.emit(mode)
-                except Exception:
-                    pass
-
-                snap = self._core.get_wallet_snapshot()
-                if snap["equity"] is not None:
-                    self._bridge.balance_signal.emit(snap["equity"], snap["available"])
-
-                res = self._core.client.get_positions(category="linear", settleCoin="USDT")
-                positions = {p["symbol"]: p for p in res["result"]["list"]
-                             if float(p.get("size", "0")) > 0}
-
-                tp_sl_map: dict = {}
-                for order in self._core._get_open_orders_all():
-                    sot = order.get("stopOrderType", "")
-                    sym = order.get("symbol", "")
-                    trigger = order.get("triggerPrice", "")
-                    if sot in ("TakeProfit", "StopLoss", "PartialTakeProfit", "PartialStopLoss") and trigger:
-                        bucket = tp_sl_map.setdefault(sym, {})
-                        if "TakeProfit" in sot:
-                            bucket["tp"] = trigger
-                        elif "StopLoss" in sot:
-                            bucket["sl"] = trigger
-
-                self._bridge.positions_synced.emit(positions, tp_sl_map)
-                self._reconcile_journal()
-            except Exception as e:
-                self._bridge.log_signal.emit(f"position sync error: {e}", True)
+                self._run_logged(self._core.refresh_account, self._core.refresh_positions,
+                                 self._core.reconcile_journal)
             finally:
                 self._tick_running = False
 
@@ -1085,7 +771,7 @@ class MainWindow(QMainWindow):
                 symbols.append(s)
         symbols = symbols[:6]
         wanted = [(s, s == current) for s in symbols]
-        if getattr(self, "_chips_state", None) == wanted:
+        if self._chips_state == wanted:
             return
         self._chips_state = wanted
         while self.chips_layout.count() > 1:
@@ -1142,15 +828,14 @@ class MainWindow(QMainWindow):
             self.ratchet_label.setText(f"ratchet &nbsp; {steps}")
         self.ratchet_label.setVisible(on)
 
-    def _ticket_values(self):
+    def _ticket_values(self) -> Ticket:
         """Resolve the ticket. Raises ValueError with a message for the preview."""
         symbol = self._normalize_symbol(self.symbol_input.text())
         if not symbol:
             raise ValueError("enter a symbol")
         rules = self._core.cache.get(symbol)
         if not rules:
-            raise ValueError(f"{symbol} not in cache" if getattr(self, "_cache_ready", False)
-                             else "loading symbology…")
+            raise ValueError(f"{symbol} not in cache" if self._cache_ready else "loading symbology…")
         side = "Buy" if self._is_long else "Sell"
         entry_t = self.entry_input.text().strip()
         if not entry_t:
@@ -1158,7 +843,7 @@ class MainWindow(QMainWindow):
         try:
             entry = float(entry_t.replace("$", "").replace(",", "").replace(" ", ""))
         except ValueError:
-            raise ValueError("entry must be a price")
+            raise ValueError("entry must be a price") from None
         if entry <= 0:
             raise ValueError("entry must be positive")
         stop_t = self.stop_input.text().strip()
@@ -1170,7 +855,7 @@ class MainWindow(QMainWindow):
         risk = resolve_risk(self.risk_input.text().strip() or "0", self._equity)
         if risk <= 0:
             raise ValueError("enter a risk amount")
-        return symbol, side, entry, sl, tp, risk, rules
+        return Ticket(symbol, side, entry, sl, tp, risk, rules)
 
     def _set_hints(self, entry=None, sl=None, tp=None, risk=None, tick=None, last=None):
         """Each hint shows what the typed form leaves implicit: a % stop shows its
@@ -1374,9 +1059,8 @@ class MainWindow(QMainWindow):
             key = event.key()
             mods = event.modifiers()
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
-                    self._execute()
-                elif obj is self.risk_input:
+                with_cmd = bool(mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
+                if with_cmd or obj is self.risk_input:
                     self._execute()
                 else:
                     self.focusNextChild()
@@ -1439,7 +1123,7 @@ class MainWindow(QMainWindow):
         tick = rules["tickSize"]
         eq = self._equity
         summary = (
-            f"{symbol} {side.upper() if side == 'Buy' else 'SHORT'}  ·  {calc['qty']} @ {fmt_px(entry, tick)}\n"
+            f"{symbol} {'LONG' if side == 'Buy' else 'SHORT'}  ·  {calc['qty']} @ {fmt_px(entry, tick)}\n"
             f"lev {calc['leverage']}x  ·  margin {fmt_usd(calc['margin_usd'], 2, signed=False)}  ·  "
             f"notional {fmt_usd(calc['notional_usd'], 0, signed=False)}\n"
             f"stop {fmt_px(sl, tick)} on mark  ·  "
@@ -1447,7 +1131,7 @@ class MainWindow(QMainWindow):
             f"risk {fmt_usd(risk, 2, signed=False)}"
             + (f"  ·  {risk / eq * 100:.1f}% of equity" if eq else "")
             + f"  ·  open after {fmt_usd(self._gov['open_risk'] + risk, 0, signed=False)}"
-        ).replace("BUY", "LONG")
+        )
         hard = [t for lvl, t, _ in self._warnings if lvl == "hard"]
         soft = [t for lvl, t, _ in self._warnings if lvl == "warn"]
 
@@ -1468,13 +1152,12 @@ class MainWindow(QMainWindow):
         self._bridge.status_signal.emit("executing trade...", T.ACCENT)
         is_strat1 = self.strat1_checkbox.isChecked()
         is_post_only = self.postonly_checkbox.isChecked()
-        is_isolated = self._core.account_margin_mode == "ISOLATED_MARGIN"
 
         def _run():
             try:
                 trade = self._core.execute_bracket(
                     symbol=symbol, side=side, entry=entry, sl=sl, tp=tp, risk_usd=risk,
-                    isolated=is_isolated, strat1=is_strat1, post_only=is_post_only,
+                    strat1=is_strat1, post_only=is_post_only,
                 )
                 self._bridge.execute_done.emit(trade, "")
             except Exception as e:
@@ -1538,7 +1221,7 @@ class MainWindow(QMainWindow):
                 return
             new_sl = ratchet_price(entry, dist, t.side, -0.5)
             if stop_ok(new_sl):
-                self._run_action(key, "stop → −½R",
+                self._run_action(key, "stop → −0.5R",
                                  lambda: self._core.modify_brackets(t, new_sl=new_sl))
         elif action == "close":
             qty = t.qty or t.cum_exec_qty or "?"
@@ -1567,7 +1250,7 @@ class MainWindow(QMainWindow):
             except ValueError as e:
                 self._append_log(f"modify error: {e}", True)
                 return
-            if new_sl is not None and t.phase in LIVE_PHASES and not stop_ok(new_sl):
+            if new_sl is not None and t.is_live and not stop_ok(new_sl):
                 return
             card = self._cards.get(key)
             if card:
@@ -1607,17 +1290,17 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────────────────────────
 
     def _on_trade_state_changed(self, trade: TradeState):
+        """A snapshot from the core. Keys change once when Bybit's orderId replaces
+        our link id, and a synced position may turn into a partial entry — both
+        arrive as a new key for a symbol that already has a live card."""
         if trade.entry_order_id in self._trades:
             self._trades[trade.entry_order_id] = trade
         else:
-            matched = False
-            for oid, t in self._trades.items():
-                if t.symbol == trade.symbol and t.phase in LIVE_PHASES:
-                    self._trades[oid] = trade
-                    matched = True
-                    break
-            if not matched:
-                self._trades[trade.entry_order_id] = trade
+            stale = next((k for k, t in self._trades.items()
+                          if t.symbol == trade.symbol and t.is_live), None)
+            if stale is not None:
+                del self._trades[stale]
+            self._trades[trade.entry_order_id] = trade
         self._panel_dirty = True
 
     def _update_trade_panel(self):
@@ -1631,19 +1314,20 @@ class MainWindow(QMainWindow):
         for k, t in active.items():
             card = self._cards.get(k)
             if card is None:
-                card = TradeCard(k, self)
+                card = TradeCard(k, on_select=self._select_card, on_action=self._card_action)
                 self._cards[k] = card
                 # Before the closed row and the trailing stretch
                 self.cards_layout.insertWidget(self.cards_layout.count() - 2, card)
-            card.update_from(t, self._core.cache.get(t.symbol),
-                             TradingCore.estimate_trade_risk(t), self._core.ratchet)
+            card.update_from(t, self._core.cache.get(t.symbol), TradingCore.estimate_trade_risk(t),
+                             self._core.ratchet,
+                             ticker=None if t.is_live else self._core.get_ticker(t.symbol))
         if self._selected_key not in active:
             self._selected_key = next(iter(active), None)
         for k, card in self._cards.items():
             card.set_selected(k == self._selected_key)
 
         self.placeholder.setVisible(not active)
-        n_live = sum(1 for t in active.values() if t.phase in LIVE_PHASES)
+        n_live = sum(1 for t in active.values() if t.is_live)
         n_pending = len(active) - n_live
         self.board_count.setText(f"{n_live} LIVE · {n_pending} PENDING" if active else "")
 
@@ -1763,78 +1447,31 @@ class MainWindow(QMainWindow):
 
     def _on_balance_updated(self, equity: float, available):
         self._equity = equity
-        if available is not None and available >= 0:
+        if available is not None:
             self._available = float(available)
         self.balance_label.setText(f"${equity:,.2f}")
         self.avail_label.setText(f"avail ${self._available:,.2f}  ·" if self._available is not None else "")
         self._update_governance()
 
     def _on_margin_mode_sync(self, mode: str):
-        self._core.account_margin_mode = mode
         self.margin_btn.setText("isolated" if mode == "ISOLATED_MARGIN" else "cross")
         self.margin_btn.setEnabled(True)
-
-    def _on_margin_mode_warning(self, mode: str):
-        self._on_margin_mode_sync(mode)
-        self._append_log("margin mode is locked while positions or orders are open", True)
 
     def _on_margin_btn_clicked(self):
         self.margin_btn.setEnabled(False)
         target_iso = self._core.account_margin_mode != "ISOLATED_MARGIN"
-        self._bridge.status_signal.emit("checking account status...", T.ACCENT)
+        self._bridge.status_signal.emit("switching margin mode...", T.ACCENT)
 
-        def _check():
+        def _switch():
             try:
-                if self._core.has_active_positions_or_orders():
-                    self._bridge.log_signal.emit(
-                        "UTA margin: cannot switch margin mode while positions or orders are open.", True)
-                    self._bridge.margin_mode_warning.emit(self._core.account_margin_mode)
-                else:
-                    target_mode = "ISOLATED_MARGIN" if target_iso else "REGULAR_MARGIN"
-                    try:
-                        self._core.client.set_margin_mode(setMarginMode=target_mode)
-                        self._core.account_margin_mode = target_mode
-                        self._bridge.log_signal.emit(
-                            f"account margin switched to {'isolated' if target_iso else 'cross'}", False)
-                        self._bridge.margin_mode_sync.emit(target_mode)
-                    except Exception as e:
-                        self._bridge.log_signal.emit(f"failed to set margin mode: {e}", True)
-                        self._bridge.margin_mode_warning.emit(self._core.account_margin_mode)
+                self._core.set_margin_mode(isolated=target_iso)
             except Exception as e:
-                self._bridge.log_signal.emit(f"error checking margin mode: {e}", True)
-                self._bridge.margin_mode_sync.emit(self._core.account_margin_mode)
+                self._bridge.log_signal.emit(f"margin mode: {e}", True)
             finally:
+                self._bridge.margin_mode_sync.emit(self._core.account_margin_mode)
                 self._bridge.status_signal.emit("live", T.POSITIVE)
 
-        threading.Thread(target=_check, daemon=True).start()
-
-    def _on_positions_synced(self, positions: dict, tp_sl_map: dict):
-        for t in list(self._trades.values()):
-            if t.phase not in LIVE_PHASES:
-                continue
-            pos = positions.get(t.symbol)
-            if pos:
-                t.unrealised_pnl = float(pos.get("unrealisedPnl", "0"))
-                t.mark_price = float(pos.get("markPrice", "0"))
-                t.position_value = float(pos.get("positionValue", "0"))
-                t.qty = pos.get("size")
-                t.leverage = pos.get("leverage", "")
-                liq = pos.get("liqPrice", "")
-                if liq and liq != "0":
-                    try:
-                        t.liq_price = float(liq)
-                    except ValueError:
-                        pass
-                bracket = tp_sl_map.get(t.symbol, {})
-                if "tp" in bracket:
-                    t.take_profit = bracket["tp"]
-                if "sl" in bracket:
-                    t.stop_loss = bracket["sl"]
-            elif t.symbol not in positions:
-                t.phase = TradeState.PHASE_CLOSED
-                t.closed_at = time.time()
-                t.close_type = "closed externally"
-        self._panel_dirty = True
+        threading.Thread(target=_switch, daemon=True).start()
 
     # ─────────────────────────────────────────────────────────────
     #  Cache
@@ -1859,35 +1496,14 @@ class MainWindow(QMainWindow):
         if count > 0:
             self._append_log(f"cache: {count} symbols", False)
             if not hasattr(self, "_core"):
-                return
-            symbols = [s for s in self._core.cache.symbols if s.endswith("USDT") and "-" not in s]
-            self._completer_model.setStringList(symbols)
+                return   # the cache loaded synchronously inside TradingCore.__init__
+            self._completer_model.setStringList(self._usdt_symbols())
             self._set_trading_enabled(True)
             self._refresh_info()
 
     # ─────────────────────────────────────────────────────────────
     #  Journal
     # ─────────────────────────────────────────────────────────────
-
-    def _reconcile_journal(self):
-        """Pull closed-PnL from Bybit and merge into the journal. Runs off-thread."""
-        if not self._reconcile_lock.acquire(blocking=False):
-            return
-        try:
-            last = max((t.get("closed_at") or 0 for t in self._journal.all_trades), default=0)
-            start_ms = int(last * 1000) if last else 0
-            records = self._core.fetch_closed_pnl(start_ms)
-            for r in records:
-                if not self._journal.has(r.get("order_id", "")):
-                    self._core.attach_risk_intent(r)
-            added = self._journal.reconcile(records)
-            if added:
-                self._bridge.log_signal.emit(f"journal: +{added} trade(s) from exchange", False)
-            self._bridge.journal_updated.emit()
-        except Exception as e:
-            self._bridge.log_signal.emit(f"journal reconcile failed: {e}", True)
-        finally:
-            self._reconcile_lock.release()
 
     def _on_journal_updated(self):
         self._update_stats_strip()
@@ -1956,80 +1572,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(event)
-
-
-# ──────────────────────────────────────────────────────────────────
-#  Journal history pop-out
-# ──────────────────────────────────────────────────────────────────
-
-class JournalDialog(QDialog):
-    """Read-only monospace ledger of closed trades (newest first)."""
-
-    def __init__(self, parent, stylesheet: str):
-        super().__init__(parent)
-        self.setWindowTitle("Viridis — Journal")
-        self.setMinimumSize(760, 460)
-        self.setStyleSheet(stylesheet)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        self._summary = QLabel("")
-        self._summary.setTextFormat(Qt.TextFormat.RichText)
-        self._summary.setWordWrap(True)
-        self._summary.setStyleSheet(
-            f"font-size: 11px; color: {T.TEXT}; background: {T.BG_RAISED}; "
-            f"border: 1px solid {T.BORDER}; border-radius: 3px; padding: 8px 10px;"
-        )
-        layout.addWidget(self._summary)
-
-        self._ledger = QTextEdit()
-        self._ledger.setReadOnly(True)
-        self._ledger.setStyleSheet(
-            f"background: {T.BG}; color: {T.TEXT_DIM}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 3px; padding: 8px; font-family: {T.MONO_CSS}; font-size: 11px;"
-        )
-        layout.addWidget(self._ledger, 1)
-
-    def refresh(self, trades: list, stats: dict):
-        pnl_color = T.POSITIVE if stats.get("total_pnl", 0) >= 0 else T.NEGATIVE
-        self._summary.setText(
-            f"<b>{stats['total']}</b> trades&nbsp;&nbsp;&nbsp;"
-            f"WR <b>{stats['win_rate']}%</b>&nbsp;&nbsp;&nbsp;"
-            f"PnL <span style='color:{pnl_color};'><b>${stats['total_pnl']:+.2f}</b></span>"
-            f"&nbsp;&nbsp;&nbsp;avgR <b>{stats['avg_r']}</b>&nbsp;&nbsp;&nbsp;"
-            f"E[<span style='color:{pnl_color};'>${stats['expectancy']:+.2f}</span>]"
-            f"&nbsp;&nbsp;&nbsp;best <span style='color:{T.POSITIVE};'>${stats['best']:+.2f}</span>"
-            f"&nbsp;&nbsp;&nbsp;worst <span style='color:{T.NEGATIVE};'>${stats['worst']:+.2f}</span>"
-        )
-
-        def esc(s: str) -> str:
-            return s.replace(" ", "&nbsp;")
-
-        header = f"{'date':<17}{'symbol':<13}{'side':<6}{'pnl':>12}{'R':>9}{'mfe':>9}{'mae':>9}{'hold':>9}"
-        rows = [f"<span style='color:{T.TEXT_MUTED};'>{esc(header)}</span>"]
-        for t in sorted(trades, key=lambda x: x.get("closed_at") or 0, reverse=True):
-            ts = t.get("closed_at")
-            date = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
-            sym = (t.get("symbol") or "")[:12]
-            side = ("long" if t.get("side") == "Buy" else "short")[:5]
-            pnl = t.get("pnl")
-            pnl_s = f"${pnl:+.2f}" if pnl is not None else "—"
-
-            def rs(v):
-                return f"{v:+.2f}R" if v is not None else "—"
-
-            dur = t.get("duration_sec")
-            hold = age_str(time.time() - dur) if dur else "—"
-            c = T.TEXT_DIM if pnl is None else (T.POSITIVE if pnl >= 0 else T.NEGATIVE)
-            line = (f"{date:<17}{sym:<13}{side:<6}{pnl_s:>12}{rs(t.get('r_multiple')):>9}"
-                    f"{rs(t.get('mfe_r')):>9}{rs(t.get('mae_r')):>9}{hold:>9}")
-            rows.append(f"<span style='color:{c};'>{esc(line)}</span>")
-
-        if len(rows) == 1:
-            rows.append(f"<span style='color:{T.TEXT_MUTED};'>no closed trades yet</span>")
-        self._ledger.setHtml("<br/>".join(rows))
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -15,7 +15,6 @@ import json
 import os
 import sys
 import threading
-import time
 from typing import Any, Dict, List
 
 
@@ -30,7 +29,6 @@ class TradeJournal:
         self._trades: List[Dict[str, Any]] = []
         self._seen: set = set()           # order_id keys already journaled
         self._lock = threading.Lock()     # reconcile (bg thread) vs stats (UI thread)
-        self._session_start = time.time()
         self._load()
 
     # ─── Persistence ─────────────────────────────────────────────
@@ -109,11 +107,6 @@ class TradeJournal:
         with self._lock:
             return list(self._trades)
 
-    @property
-    def count(self) -> int:
-        with self._lock:
-            return len(self._trades)
-
     def since(self, ts: float) -> List[Dict[str, Any]]:
         """Trades closed at or after *ts* (epoch seconds), oldest first."""
         with self._lock:
@@ -148,12 +141,10 @@ class TradeJournal:
                 break
         return out
 
-    def stats(self, session_only: bool = False, since: float = 0) -> Dict[str, Any]:
-        """Summary statistics — lifetime, this session, or since a timestamp."""
+    def stats(self, since: float = 0) -> Dict[str, Any]:
+        """Summary statistics, lifetime or since a timestamp."""
         with self._lock:
             trades = list(self._trades)
-        if session_only:
-            since = max(since or 0, self._session_start)
         if since:
             trades = [t for t in trades if (t.get("closed_at") or 0) >= since]
 

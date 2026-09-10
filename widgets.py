@@ -15,7 +15,7 @@ trading logic — the window hands them numbers and strings.
 from typing import List, Optional
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPolygonF
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import QLabel, QLineEdit, QSizePolicy, QWidget
 
 import theme as T
@@ -127,7 +127,8 @@ class Ladder(QWidget):
         hi, lo = max(prices), min(prices)
         span = (hi - lo) or 1.0
         # Rows compress a little when the ladder is short, never below 13px.
-        row_h = min(self.ROW_H, max(13.0, (bottom - top) / max(1, len(rows) - 1)))
+        natural = (bottom - top) / max(1, len(rows) - 1)
+        row_h = 13.0 if natural < 13.0 else self.ROW_H if natural > self.ROW_H else natural
         for r in rows:
             r["y"] = top + (hi - r["price"]) / span * (bottom - top)
         # Push overlapping rows apart, then pull the group back inside.
@@ -349,7 +350,7 @@ class EquityCurve(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        lo, hi = min(0.0, min(self._cum)), max(0.0, max(self._cum))
+        lo, hi = min(0.0, *self._cum), max(0.0, *self._cum)
         span = (hi - lo) or 1.0
         n = len(self._cum)
 

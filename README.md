@@ -53,16 +53,17 @@ Bybit/
 ├── trading_core.py       Risk math, OTOCO execution, WebSocket state machine, Strat1, ledger
 ├── journal.py            Exchange-mirrored trade journal (Bybit closed-PnL) + stats
 ├── theme.py              Palette + stylesheet
-├── widgets.py            Painted widgets: ladder, mini ladder, charts, hinted inputs
-├── main.py               PyQt6 board (ticket, cards, governance strip, drawer)
-├── tests/                Unit tests for the pure math (python -m unittest discover -s tests)
-├── test_trade.py         CLI integration test harness
+├── widgets.py            Painted primitives: ladder, mini ladder, charts, hinted input, meter
+├── views.py              Trade card, journal dialog, text formatting
+├── main.py               PyQt6 window: ticket, board, governance strip, drawer
+├── tests/                Unit tests: risk math, tiers, ratchet, reconciliation (python -m unittest discover -s tests)
+├── test_trade.py         CLI dry run through the engine, optional fire
 ├── docs/                 Architecture & design guide (HTML, diagrams)
 ├── bybit_symbology.json  Auto-generated instrument cache
 └── trade_journal.json    Permanent local trade archive
 ```
 
-**Signal flow:** `TradingCore` (background threads) → `SignalBridge` (Qt signals) → `MainWindow` (main thread). All exchange I/O is non-blocking; all GUI updates go through signals. The core is the single writer of trade state — the GUI holds snapshots and hands them back for actions.
+**Signal flow:** `TradingCore` (background threads) → `SignalBridge` (Qt signals) → `MainWindow` (main thread). Every exchange call lives in the core, including the 30-second REST reconciliation and the journal sync; the window holds snapshots, renders them, and hands them back for actions.
 
 ## Documentation
 

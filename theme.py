@@ -104,19 +104,8 @@ QPushButton:hover {{ border-color: {BORDER_FCS}; color: {TEXT}; }}
 QPushButton:pressed {{ background: {BG_INPUT}; }}
 QPushButton:disabled {{ color: {TEXT_MUTED}; border-color: {BORDER}; }}
 
-QPushButton#side {{
-    font-size: 12px; font-weight: 700; letter-spacing: 1px; padding: 0;
-    border: 1px solid {BORDER}; border-radius: 0; background: transparent; color: {TEXT_DIM};
-}}
-QPushButton#side[on="true"][kind="long"]  {{ background: {POSITIVE}; color: #FFFFFF; border-color: {POSITIVE}; }}
-QPushButton#side[on="true"][kind="short"] {{ background: {NEGATIVE}; color: #FFFFFF; border-color: {NEGATIVE}; }}
-
-QPushButton#execute {{
-    font-size: 13px; font-weight: 700; letter-spacing: 1.5px; color: #FFFFFF; border: none;
-}}
-QPushButton#execute[kind="long"]  {{ background: {POSITIVE}; }}
-QPushButton#execute[kind="short"] {{ background: {NEGATIVE}; }}
-QPushButton#execute:disabled {{ background: {BORDER}; color: {TEXT_MUTED}; }}
+/* side and execute buttons get explicit per-widget sheets in main.py:
+   QPushButton ignores a background that arrives via a property selector */
 
 QPushButton#chip {{
     font-size: 10px; font-weight: 500; letter-spacing: 0.5px; padding: 3px 8px;

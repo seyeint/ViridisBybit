@@ -53,8 +53,8 @@
     <div class="mod"><div class="fn">cache_engine.py</div><div class="ds">Instrument symbology + every risk-limit tier per symbol (MMR, max leverage, cap). Paginated pull, cached to disk (24h TTL), O(1) lookup.</div></div>
     <div class="mod"><div class="fn">trading_core.py</div><div class="ds">The engine: risk math, OTOCO execution, REST + dual WebSocket state machine, Strat1 ratchet, risk ledger, journal reconciliation. No GUI. The single writer of trade state.</div></div>
     <div class="mod"><div class="fn">journal.py</div><div class="ds">Append-only trade journal, deduped by closing order ID, mirrored from Bybit's closed-PnL. Stats, windows, streaks, R / MFE / MAE.</div></div>
-    <div class="mod"><div class="fn">main.py</div><div class="ds">PyQt6 board: the ticket with its live preview and ladder, position cards with inline actions, the governance strip, stats strip and log drawer.</div></div>
-    <div class="mod"><div class="fn">theme.py · widgets.py</div><div class="ds">Palette + stylesheet, and the painted widgets: ladder, mini ladder, R histogram, equity curve, hinted inputs, meters.</div></div>
+    <div class="mod"><div class="fn">main.py</div><div class="ds">PyQt6 window: the ticket with its live preview and ladder, the board of cards, the governance strip, stats strip and log drawer. Holds snapshots only.</div></div>
+    <div class="mod"><div class="fn">theme.py · widgets.py · views.py</div><div class="ds">Palette + stylesheet; painted primitives (ladder, mini ladder, R histogram, equity curve, hinted input, meter); composite views (trade card, journal dialog) and text formatting.</div></div>
     <div class="mod"><div class="fn">tests/</div><div class="ds">Unit tests for the pure math — sizing, tiers, cushion, relative inputs, ratchet, journal join. <code>python -m unittest discover -s tests</code></div></div>
     <div class="mod"><div class="fn">test_trade.py</div><div class="ds">CLI dry-run harness: prints the exact payload, leverage, margin, and fee estimate before optionally firing.</div></div>
   </div>
@@ -164,9 +164,8 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
       <div class="h">① Qt main thread</div>
       <ul>
         <li>All widget rendering &amp; reads</li>
-        <li>30s position-sync timer</li>
         <li>500ms panel-flush timer</li>
-        <li>Spawns workers for execute / modify / cancel so it never blocks</li>
+        <li>Spawns workers for execute / modify / cancel / close and the 30s REST reconciliation, so it never blocks and never touches the exchange itself</li>
       </ul>
     </div>
     <div class="lane priv">
@@ -189,10 +188,10 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
       </ul>
     </div>
     <div class="lane work">
-      <div class="h">④ Worker queue</div>
+      <div class="h">④ Worker queue + REST reconciliation</div>
       <ul>
-        <li>Runs REST ops dispatched from the WS threads (e.g. Strat1 amends)</li>
-        <li>Keeps slow REST off the WS callbacks</li>
+        <li>Runs REST ops dispatched from the WS threads (Strat1 amends, ledger writes)</li>
+        <li>Every 30s: account, positions + brackets, journal — the core updates its own state and emits snapshots; a fill younger than 15s is trusted over the REST snapshot</li>
       </ul>
     </div>
   </div>

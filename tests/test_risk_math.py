@@ -12,6 +12,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,15 +64,70 @@ class FakeQueue:
         self.items.append(item)
 
 
-def make_core():
-    """A TradingCore without __init__ (no REST client, no threads)."""
+class StubClient:
+    """Just enough of pybit's HTTP for the reconciliation and execution paths."""
+
+    def __init__(self, positions=(), orders=(), leverage_error=None):
+        self.positions = list(positions)
+        self.orders = list(orders)
+        self.leverage_error = leverage_error
+        self.calls = []
+
+    def get_positions(self, **kw):
+        self.calls.append(("get_positions", kw))
+        rows = [p for p in self.positions if not kw.get("symbol") or p["symbol"] == kw["symbol"]]
+        return {"result": {"list": rows}}
+
+    def get_open_orders(self, **kw):
+        self.calls.append(("get_open_orders", kw))
+        return {"result": {"list": list(self.orders), "nextPageCursor": ""}}
+
+    def set_leverage(self, **kw):
+        self.calls.append(("set_leverage", kw))
+        if self.leverage_error:
+            raise RuntimeError(self.leverage_error)
+        return {"retCode": 0}
+
+    def place_order(self, **kw):
+        self.calls.append(("place_order", kw))
+        return {"retCode": 0, "result": {"orderId": "oid-1"}}
+
+    def set_margin_mode(self, **kw):
+        self.calls.append(("set_margin_mode", kw))
+        return {"retCode": 0}
+
+
+def make_core(client=None):
+    """A TradingCore without __init__ (no REST client, no threads, no disk)."""
     core = tc.TradingCore.__new__(tc.TradingCore)
     core.cache = StubCache(RULES)
-    core._on_log = lambda *a, **k: None
+    core.client = client or StubClient()
+    core._on_log = lambda *_: None
+    core._on_trade_update = lambda _: None
+    core._on_margin_mode = lambda _: None
+    core._on_journal = lambda: None
     core._ratchet = tc.parse_ratchet(config.STRAT1_RATCHET)
     core._strat1_last_amend = {}
     core._queue = FakeQueue()
+    core._trades = {}
+    core._lock = threading.RLock()
+    core._risk_ledger_lock = threading.Lock()
+    core._risk_ledger = []
+    core._save_risk_ledger = lambda: None
+    core.account_margin_mode = "ISOLATED_MARGIN"
     return core
+
+
+def live_trade(symbol="BTCUSDT", side="Buy", entry=100.0, sl="98", tp="104", qty="2", key=None):
+    t = tc.TradeState(symbol, side, key or f"oid-{symbol}")
+    t.phase = tc.TradeState.PHASE_LIVE
+    t.entry_price = t.fill_price = entry
+    t.qty = t.entry_qty = t.cum_exec_qty = qty
+    t.stop_loss, t.take_profit = sl, tp
+    t.leverage = "20"
+    t.live_since = time.time() - 60
+    t.original_sl_distance = abs(entry - float(sl))
+    return t
 
 
 class SetFees(unittest.TestCase):
@@ -297,12 +354,151 @@ class TestJournal(unittest.TestCase):
             self.assertEqual(j.reconcile([{"order_id": "4"}, {"order_id": "5", "pnl": 1, "closed_at": 500}]), 1)
             self.assertEqual(j.loss_streak(), 0)
 
+    def test_reconcile_journal_attaches_r_only_to_new_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            core = make_core()
+            core.journal = TradeJournal(os.path.join(d, "j.json"))
+            core._reconcile_lock = threading.Lock()
+            core._risk_ledger = [{"symbol": "BTCUSDT", "entry_price": 100.0, "risk_usd": 10.0,
+                                  "opened_at": 1.0, "strat1": False, "sl": 98.0, "tp": 104.0,
+                                  "link_id": "l", "closing_order_ids": ["c-1"], "ts": time.time(),
+                                  "mfe": 103.0, "mae": 99.0}]
+            record = {"orderId": "c-1", "symbol": "BTCUSDT", "side": "Sell", "avgEntryPrice": "100",
+                      "avgExitPrice": "102", "closedPnl": "3.9", "updatedTime": "2000000", "qty": "2"}
+            core.fetch_closed_pnl = lambda start_ms: [core._normalize_closed_pnl(record)]
+            self.assertEqual(core.reconcile_journal(), 1)
+            row = core.journal.all_trades[0]
+            self.assertEqual((row["side"], row["r_multiple"], row["mfe_r"], row["mae_r"]), ("Buy", 0.39, 1.5, -0.5))
+            self.assertEqual(core._risk_ledger, [])                 # consumed
+            self.assertEqual(core.reconcile_journal(), 0)           # deduped on the second pass
+
 
 class TestFormatValue(unittest.TestCase):
     def test_rounding(self):
         self.assertEqual(tc.format_value(64951.37, "0.10"), "64951.40")
         self.assertEqual(tc.format_value(0.01437, "0.001", round_down=True), "0.014")
         self.assertEqual(tc.format_value(0.0199999, "0.0001"), "0.0200")
+
+
+class TestExecution(SetFees):
+    def test_payload_carries_the_partial_bracket(self):
+        core = make_core()
+        calc = core.calculate_trade("BTCUSDT", "Buy", 74300, 73300, 50)
+        p = tc.TradingCore.build_bracket_payload(calc, 75300, True, "link-1")
+        self.assertEqual((p["orderType"], p["tpslMode"], p["timeInForce"]), ("Limit", "Partial", "PostOnly"))
+        self.assertEqual((p["stopLoss"], p["slOrderType"], p["slTriggerBy"]), ("73300.00", "Market", config.SL_TRIGGER_BY))
+        self.assertEqual((p["takeProfit"], p["tpLimitPrice"], p["tpOrderType"]), ("74800.00", "75300.00", "Limit"))
+        self.assertEqual(p["orderLinkId"], "link-1")
+        self.assertNotIn("takeProfit", tc.TradingCore.build_bracket_payload(calc, None, False, "x"))
+
+    def test_execute_registers_the_trade_and_sets_leverage_first(self):
+        client = StubClient()
+        core = make_core(client)
+        trade = core.execute_bracket("BTCUSDT", "Buy", 74300, 73300, 75300, 50, post_only=True)
+        names = [c[0] for c in client.calls]
+        self.assertEqual(names, ["set_leverage", "place_order"])
+        self.assertEqual(client.calls[0][1]["buyLeverage"], "48")
+        self.assertEqual(trade.entry_order_id, "oid-1")
+        self.assertIn("oid-1", core._trades)
+        self.assertEqual(trade.take_profit, "75300.00")
+        self.assertEqual(len(core._risk_ledger), 1)
+
+    def test_execute_aborts_when_leverage_cannot_be_set(self):
+        """Sending the order anyway would use whatever leverage the symbol last had."""
+        client = StubClient(leverage_error="110012 leverage exceeds limit")
+        core = make_core(client)
+        with self.assertRaises(ValueError):
+            core.execute_bracket("BTCUSDT", "Buy", 74300, 73300, 75300, 50)
+        self.assertEqual([c[0] for c in client.calls], ["set_leverage"])
+        self.assertEqual(core._trades, {})
+
+    def test_execute_refuses_a_second_trade_on_the_symbol(self):
+        core = make_core()
+        core._trades["x"] = live_trade("BTCUSDT")
+        with self.assertRaises(ValueError):
+            core.execute_bracket("BTCUSDT", "Buy", 74300, 73300, 75300, 50)
+
+    def test_set_margin_mode_refuses_with_open_positions(self):
+        client = StubClient(positions=[{"symbol": "BTCUSDT", "size": "1"}])
+        core = make_core(client)
+        with self.assertRaises(ValueError):
+            core.set_margin_mode(isolated=False)
+        self.assertNotIn("set_margin_mode", [c[0] for c in client.calls])
+        core.client = StubClient()
+        self.assertEqual(core.set_margin_mode(isolated=False), "REGULAR_MARGIN")
+
+
+class TestReconciliation(SetFees):
+    POS = {"symbol": "BTCUSDT", "size": "2", "avgPrice": "100", "unrealisedPnl": "6", "markPrice": "103",
+           "leverage": "20", "liqPrice": "95.5", "side": "Buy", "takeProfit": "0", "stopLoss": "0"}
+    CHILDREN = [{"symbol": "BTCUSDT", "stopOrderType": "PartialTakeProfit", "triggerPrice": "102"},
+                {"symbol": "BTCUSDT", "stopOrderType": "PartialStopLoss", "triggerPrice": "97.5"},
+                {"symbol": "BTCUSDT", "stopOrderType": "", "triggerPrice": ""}]
+
+    def test_bracket_map(self):
+        self.assertEqual(tc.TradingCore._bracket_map(self.CHILDREN), {"BTCUSDT": {"tp": "102", "sl": "97.5"}})
+
+    def test_refresh_positions_updates_live_fields_and_bracket(self):
+        core = make_core(StubClient(positions=[self.POS], orders=self.CHILDREN))
+        t = live_trade("BTCUSDT")
+        core._trades[t.entry_order_id] = t
+        core.refresh_positions()
+        self.assertEqual((t.mark_price, t.unrealised_pnl, t.liq_price), (103.0, 6.0, 95.5))
+        self.assertEqual((t.take_profit, t.stop_loss), ("102", "97.5"))
+        self.assertEqual(t.mfe_price, 103.0)
+        self.assertTrue(t.is_live)
+
+    def test_refresh_positions_closes_a_vanished_position_but_spares_a_fresh_fill(self):
+        core = make_core(StubClient(positions=[], orders=[]))
+        old = live_trade("BTCUSDT", key="old")
+        fresh = live_trade("ETHUSDT", key="fresh")
+        fresh.live_since = time.time()
+        core._trades.update({"old": old, "fresh": fresh})
+        core.refresh_positions()
+        self.assertEqual(old.phase, tc.TradeState.PHASE_CLOSED)
+        self.assertEqual(old.close_type, "closed externally")
+        self.assertTrue(fresh.is_live)
+
+    def test_sync_existing_rebuilds_live_and_pending_trades(self):
+        resting = {"orderId": "o-2", "symbol": "ETHUSDT", "side": "Sell", "orderStatus": "New",
+                   "price": "3900", "qty": "1.2", "cumExecQty": "0", "avgPrice": "", "orderLinkId": "vir_x",
+                   "stopOrderType": ""}
+        core = make_core(StubClient(positions=[self.POS], orders=self.CHILDREN + [resting]))
+        active = core.sync_existing()
+        by_symbol = {t.symbol: t for t in active}
+        self.assertEqual(set(by_symbol), {"BTCUSDT", "ETHUSDT"})
+        btc, eth = by_symbol["BTCUSDT"], by_symbol["ETHUSDT"]
+        self.assertEqual((btc.phase, btc.fill_price, btc.qty, btc.liq_price), ("LIVE", 100.0, "2", 95.5))
+        self.assertEqual((btc.take_profit, btc.stop_loss), ("102", "97.5"))
+        self.assertEqual((eth.phase, eth.entry_price, eth.order_link_id), ("PENDING", 3900.0, "vir_x"))
+
+    def test_position_event_closes_and_prices_the_trade(self):
+        core = make_core()
+        t = live_trade("BTCUSDT")
+        core._trades[t.entry_order_id] = t
+        core._handle_position_event({"data": [{**self.POS, "size": "0", "markPrice": "104"}]})
+        self.assertEqual(t.phase, tc.TradeState.PHASE_CLOSED)
+        self.assertEqual(t.close_price, 104.0)
+        self.assertAlmostEqual(t.pnl, (104 - 100) * 2 - 100 * 2 * MAKER - 104 * 2 * TAKER, places=6)
+        self.assertEqual(core._queue.items[0][0], core._update_risk_intent)
+
+    def test_order_event_fill_sets_live_since_and_tp_child_closes(self):
+        core = make_core()
+        t = tc.TradeState("BTCUSDT", "Buy", "link-1")
+        t.order_link_id = "link-1"
+        t.entry_price = 100.0
+        core._trades["link-1"] = t
+        core._subscribe_ticker = lambda _s: None
+        core._handle_order_event({"data": [{"orderId": "oid-9", "orderLinkId": "link-1", "orderStatus": "Filled",
+                                            "stopOrderType": "", "symbol": "BTCUSDT", "avgPrice": "100.5",
+                                            "cumExecQty": "2", "qty": "2"}]})
+        self.assertEqual((t.phase, t.fill_price, t.qty), ("LIVE", 100.5, "2"))
+        self.assertIsNotNone(t.live_since)
+        self.assertIn("oid-9", core._trades)
+        core._handle_order_event({"data": [{"orderId": "tp-1", "orderStatus": "Filled", "symbol": "BTCUSDT",
+                                            "stopOrderType": "PartialTakeProfit", "avgPrice": "104"}]})
+        self.assertEqual((t.phase, t.close_type, t.close_price), ("CLOSED", "PartialTakeProfit", 104.0))
+        self.assertEqual(core._queue.items[-1][0], core._note_closing_order)
 
 
 if __name__ == "__main__":
