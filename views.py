@@ -96,9 +96,9 @@ def local_midnight() -> float:
 
 class TradeCard(QFrame):
     """
-    One active trade. At rest: a header line and the mini ladder. Selected
-    (clicked): the detail line and the action buttons unfold; the same
-    details show as a tooltip on hover. Reports through `on_select(key)` and
+    One active trade: a header line and the mini ladder. Clicking the card
+    unfolds its action buttons (one card at a time); the numbers live in the
+    tooltip and show on hover only. Reports through `on_select(key)` and
     `on_action(key, action, payload)`; actions are "be", "half", "close",
     "cancel" and "apply" (payload: tp/sl text).
     """
@@ -125,12 +125,6 @@ class TradeCard(QFrame):
 
         self.mini = MiniLadder()
         lay.addWidget(self.mini)
-
-        self.details = QLabel("")
-        self.details.setTextFormat(Qt.TextFormat.RichText)
-        self.details.setWordWrap(True)
-        self.details.hide()
-        lay.addWidget(self.details)
 
         self.actions = QWidget()
         acts = QHBoxLayout(self.actions)
@@ -177,7 +171,6 @@ class TradeCard(QFrame):
         return b
 
     def _clicked(self, action: str) -> None:
-        self._on_select(self.key)
         if action == "edit":
             show = not self.edit_row.isVisible()
             self.edit_row.setVisible(show)
@@ -205,13 +198,12 @@ class TradeCard(QFrame):
         self.update()
 
     def set_selected(self, on: bool) -> None:
-        """Selection is also expansion: only the selected card shows details and actions."""
+        """The selected card is the unfolded one: it shows its action buttons."""
         if bool(self.property("selected")) != on:
             self.setProperty("selected", on)
             self._repolish()
         if self._expanded != on:
             self._expanded = on
-            self.details.setVisible(on)
             self.actions.setVisible(on)
             if not on:
                 self.hide_edit()
@@ -279,7 +271,7 @@ class TradeCard(QFrame):
             if ref and entry:
                 gap = abs(float(ref) - entry) / entry
                 head += dim(f" · {gap * 100:.2f}% {'below the ask' if long else 'above the bid'}")
-            right = span(age_str(t.opened_at), T.TEXT_DIM, 10)
+            right = span(f"resting {age_str(t.opened_at)}", T.TEXT_DIM, 10)
         self.line1.setText(
             f"<table width='100%' cellspacing='0' cellpadding='0'><tr>"
             f"<td>{head}</td><td align='right'>{right}</td></tr></table>"
@@ -287,48 +279,44 @@ class TradeCard(QFrame):
 
         # Live: the caret is the mark (PnL and liquidation reference). Resting:
         # a hollow caret at the last traded price, which is what fills the entry.
-        self.mini.set_levels(entry, sl, tp, liq, mark if live else t.last_price,
-                             t.mfe_price if live else None, pending=not live)
+        self.mini.set_levels(entry, sl, tp, liq, mark if live else t.last_price, pending=not live)
 
-        # ── Details: unfold on click, tooltip on hover ──
-        parts = [f"lev {v((t.leverage or '--') + 'x')}",
-                 f"qty {v(t.qty or t.entry_qty or '--')}",
-                 f"tp {v(px(tp))}", f"sl {v(px(sl))}"]
+        # ── The numbers: tooltip only ──
+        lines = [f"lev {v((t.leverage or '--') + 'x')} · qty {v(t.qty or t.entry_qty or '--')}",
+                 f"tp {v(px(tp))} · sl {v(px(sl))}"]
         if liq and entry and sl:
             cushion = (sl - liq) / entry if long else (liq - sl) / entry
             ccol = T.NEGATIVE if cushion <= 0 else (T.AMBER if cushion < 0.001 else T.TEXT)
-            parts.append(f"liq {v(px(liq))} · {span(f'{cushion * 100:.2f}%', ccol, weight=500)} behind sl"
-                         + (" (est)" if liq_est else ""))
+            lines.append(f"liq {v(px(liq))} · {span(f'{cushion * 100:.2f}%', ccol, weight=500)} behind the stop"
+                         + (" (estimate)" if liq_est else ""))
         if live and tp and entry and mark and tp != entry:
             prog = (mark - entry) / (tp - entry) if long else (entry - mark) / (entry - tp)
-            parts.append(f"{v(f'{prog * 100:.0f}%')} of the way to tp")
+            lines.append(f"{v(f'{prog * 100:.0f}%')} of the way to the target")
         if live and dist and entry:
+            best = worst = None
             if t.mfe_price:
-                r = (t.mfe_price - entry) / dist if long else (entry - t.mfe_price) / dist
-                parts.append(f"mfe {span(fmt_r(r), T.POSITIVE)}")
+                best = (t.mfe_price - entry) / dist if long else (entry - t.mfe_price) / dist
             if t.mae_price:
-                r = (t.mae_price - entry) / dist if long else (entry - t.mae_price) / dist
-                parts.append(f"mae {span(fmt_r(r), T.NEGATIVE)}")
+                worst = (t.mae_price - entry) / dist if long else (entry - t.mae_price) / dist
+            if best is not None or worst is not None:
+                lines.append("so far: best " + (span(fmt_r(best), T.POSITIVE) if best is not None else "--")
+                             + " · worst " + (span(fmt_r(worst), T.NEGATIVE) if worst is not None else "--"))
         if t.entry_is_maker is False:
-            parts.append(span(f"taker entry · fee ${t.entry_fee_actual or 0:.2f}", T.NEGATIVE))
+            lines.append(span(f"entry filled as taker · fee ${t.entry_fee_actual or 0:.2f}", T.NEGATIVE))
         if t.strat1_enabled:
             n = len(ratchet)
             if t.strat1_phase >= n:
-                parts.append(f"strat1 {v('done')}")
+                lines.append(f"strat1 {v('done')}")
             else:
                 nxt = ratchet[t.strat1_phase]
-                parts.append(f"strat1 {v(f'{t.strat1_phase}/{n}')} · next at {nxt[0] * 100:.0f}% "
+                lines.append(f"strat1 {v(f'{t.strat1_phase}/{n}')} · next at {nxt[0] * 100:.0f}% "
                              f"locks {nxt[1]:+.1f}R")
         if not live:
-            parts.append(f"risk {v(fmt_usd(risk, 0, signed=False) if risk else '?')}")
-            if tp and entry and dist:
-                parts.append(f"rr {v(f'1:{abs(tp - entry) / dist:.2f}')}")
-        elif t.opened_at:
-            parts.append(f"open {age_str(t.opened_at)}")
-        # Items wrap as a whole, never in the middle of "mae −0.22R".
-        parts = [p.replace(" ", "&nbsp;") for p in parts]
-        self.details.setText(span(" &nbsp;· ".join(parts), T.TEXT_DIM, 10.5))
-        self.setToolTip("<span style='font-size:11px;'>" + "<br>".join(parts) + "</span>")
+            lines.append(f"risk {v(fmt_usd(risk, 0, signed=False) if risk else '?')}"
+                         + (f" · rr {v(f'1:{abs(tp - entry) / dist:.2f}')}" if tp and entry and dist else ""))
+        elif t.live_since or t.opened_at:
+            lines.append(f"in the trade {age_str(t.live_since or t.opened_at)}")
+        self.setToolTip("<span style='font-size:11px;'>" + "<br>".join(lines) + "</span>")
 
         for b in (self.btn_be, self.btn_half, self.btn_close):
             b.setVisible(live)
@@ -387,7 +375,7 @@ class JournalDialog(QDialog):
         def rs(v) -> str:
             return f"{v:+.2f}R" if v is not None else "—"
 
-        header = f"{'date':<17}{'symbol':<13}{'side':<6}{'pnl':>12}{'R':>9}{'mfe':>9}{'mae':>9}{'hold':>9}"
+        header = f"{'date':<17}{'symbol':<13}{'side':<6}{'pnl':>12}{'R':>9}{'best':>9}{'worst':>9}{'hold':>9}"
         rows = [f"<span style='color:{T.TEXT_MUTED};'>{esc(header)}</span>"]
         for t in sorted(trades, key=lambda x: x.get("closed_at") or 0, reverse=True):
             ts = t.get("closed_at")

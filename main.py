@@ -410,7 +410,7 @@ class MainWindow(QMainWindow):
         self.board_count.setStyleSheet(f"font-size: 9px; letter-spacing: 1.5px; color: {T.TEXT_DIM};")
         head.addWidget(self.board_count)
         head.addStretch()
-        hint = QLabel("click a card for its details and actions · hover for the numbers")
+        hint = QLabel("click a card for its actions · hover for the numbers")
         hint.setStyleSheet(f"font-size: 10px; color: {T.TEXT_MUTED};")
         head.addWidget(hint)
         lay.addLayout(head)
@@ -1175,7 +1175,6 @@ class MainWindow(QMainWindow):
             self._append_log(f"execution error: {error_msg or 'unknown error'}", True)
         else:
             self._trades[trade.entry_order_id] = trade.clone()
-            self._selected_key = trade.entry_order_id
             self._update_trade_panel()
             self._update_governance()
             self._refresh_chips()
@@ -1186,12 +1185,11 @@ class MainWindow(QMainWindow):
     #  Card actions
     # ─────────────────────────────────────────────────────────────
 
-    def _select_card(self, key: str):
-        if key == self._selected_key:
-            return
-        self._selected_key = key
+    def _toggle_card(self, key: str):
+        """Click a card to unfold its actions, click again to fold. One at a time, none by default."""
+        self._selected_key = None if key == self._selected_key else key
         for k, card in self._cards.items():
-            card.set_selected(k == key)
+            card.set_selected(k == self._selected_key)
 
     def _card_action(self, key: str, action: str, payload: Optional[dict] = None):
         t = self._trades.get(key)
@@ -1318,7 +1316,7 @@ class MainWindow(QMainWindow):
         for k, t in active.items():
             card = self._cards.get(k)
             if card is None:
-                card = TradeCard(k, on_select=self._select_card, on_action=self._card_action)
+                card = TradeCard(k, on_select=self._toggle_card, on_action=self._card_action)
                 self._cards[k] = card
                 # Before the closed row and the trailing stretch
                 self.cards_layout.insertWidget(self.cards_layout.count() - 2, card)
@@ -1326,7 +1324,7 @@ class MainWindow(QMainWindow):
                              self._core.ratchet,
                              ticker=None if t.is_live else self._core.get_ticker(t.symbol))
         if self._selected_key not in active:
-            self._selected_key = next(iter(active), None)
+            self._selected_key = None
         for k, card in self._cards.items():
             card.set_selected(k == self._selected_key)
 

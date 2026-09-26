@@ -214,8 +214,7 @@ class Ladder(QWidget):
 # ──────────────────────────────────────────────────────────────────
 
 class MiniLadder(QWidget):
-    """One-line track: liq · stop · entry · target, with the mark as a caret
-    and the max favourable excursion as a hollow dot."""
+    """One-line track: liq · stop · entry · target, with the price as a caret."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -225,10 +224,10 @@ class MiniLadder(QWidget):
 
     def set_levels(self, entry: Optional[float], sl: Optional[float], tp: Optional[float],
                    liq: Optional[float] = None, mark: Optional[float] = None,
-                   mfe: Optional[float] = None, pending: bool = False) -> None:
+                   pending: bool = False) -> None:
         """`mark` is the caret. For a resting entry pass the last traded price and
         pending=True: the caret is drawn hollow until the fill turns it solid."""
-        self._levels = {"entry": entry, "sl": sl, "tp": tp, "liq": liq, "mark": mark, "mfe": mfe}
+        self._levels = {"entry": entry, "sl": sl, "tp": tp, "liq": liq, "mark": mark}
         self._pending = pending
         self.update()
 
@@ -274,10 +273,6 @@ class MiniLadder(QWidget):
                 p.drawLine(QPointF(xx, ty + 3), QPointF(xx, ty + 8))
                 p.drawText(QRectF(xx - 24, ty + 9, 48, 9), _CENTER, label)
 
-        if L.get("mfe"):
-            p.setPen(QPen(_c(T.TEXT_DIM), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(x(L["mfe"]), 5), 2.5, 2.5)
         if L.get("mark"):
             xx = x(L["mark"])
             if self._pending:

@@ -321,13 +321,13 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
     the dollars at that level and the R. The cushion between liquidation and stop is visible, not implied.</li>
   </ul>
   <h3>Cards</h3>
-  <p>One per active trade. At rest a card is a header — symbol, side, entry → mark, PnL in $ and R — over a
-  mini ladder with stop, target and liquidation. Clicking a card unfolds its details (leverage, quantity, the
-  cushion behind the stop, progress to target, MFE/MAE in R, Strat1 phase, a taker-entry flag) and its
-  actions — stop to break-even, stop to −0.5R, close at market, cancel, edit TP/SL; only one card is
-  unfolded at a time, and hovering any card shows the same numbers as a tooltip. Actions resolve to the
-  core's own trade object, so the next ticker snapshot carries the change instead of reverting it. A stop
-  that would trigger immediately is refused before it is sent.</p>
+  <p>One per active trade: a header — symbol, side, entry → mark, PnL in $ and R — over a mini ladder with
+  stop, target, liquidation and the price caret. Clicking a card unfolds its actions — stop to break-even,
+  stop to −0.5R, close at market, cancel, edit TP/SL — one card at a time and none by default. The numbers
+  (leverage, quantity, the cushion behind the stop, progress to target, best and worst excursion in R,
+  Strat1 phase, a taker-entry flag, time in the trade) live in the tooltip and show on hover only. Actions
+  resolve to the core's own trade object, so the next ticker snapshot carries the change instead of
+  reverting it. A stop that would trigger immediately is refused before it is sent.</p>
   <h3>Governance strip</h3>
   <p>Three numbers: what you lose if every active stop hits (the sum of the dollars at the stops, derived
   from the bracket for positions the app did not place — nothing to do with liquidation), today's realised
