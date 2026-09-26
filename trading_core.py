@@ -217,6 +217,7 @@ class TradeState:
         # Live fields (ticker + position streams)
         self.unrealised_pnl: Optional[float] = None
         self.mark_price: Optional[float] = None
+        self.last_price: Optional[float] = None         # last traded price; what decides a resting entry's fill
         self.liq_price: Optional[float] = None          # exchange-reported once live; sizing estimate before
         self.liq_warned: bool = False
         self.mfe_price: Optional[float] = None          # best mark seen while live
@@ -781,10 +782,10 @@ class TradingCore:
                     testnet=config.USE_TESTNET,
                     channel_type="linear",
                 )
-                # Subscribe to tickers for any existing live positions
+                # Tickers for every active trade: live ones for PnL and Strat1,
+                # resting entries for the distance to their fill.
                 with self._lock:
-                    symbols = [t.symbol for t in self._trades.values()
-                               if t.phase in (TradeState.PHASE_PARTIAL, TradeState.PHASE_LIVE)]
+                    symbols = {t.symbol for t in self._trades.values() if t.is_active}
                 for sym in symbols:
                     self._subscribe_ticker(sym)
                 self.log("ticker stream connected")
@@ -926,38 +927,31 @@ class TradingCore:
                 if v:
                     cached[k] = v
 
-        mark_str = data.get("markPrice")
-        if not mark_str:
+        last = _f(data.get("lastPrice"))
+        mark = _f(data.get("markPrice"))
+        if last is None and mark is None:
             return
-        mark = float(mark_str)
 
-        snapshot = None
         strat1_snapshot = None
         with self._lock:
-            for trade in self._trades.values():
-                if trade.symbol == symbol and trade.phase in (
-                    TradeState.PHASE_PARTIAL,
-                    TradeState.PHASE_LIVE,
-                ):
-                    trade.mark_price = mark
-                    self._track_excursion(trade, mark)
-                    if trade.fill_price and trade.qty:
-                        qty = float(trade.qty)
-                        if trade.side == "Buy":
-                            trade.unrealised_pnl = (mark - trade.fill_price) * qty
-                        else:
-                            trade.unrealised_pnl = (trade.fill_price - mark) * qty
-                    snapshot = trade.clone()
+            trade = next((t for t in self._trades.values() if t.symbol == symbol and t.is_active), None)
+            if trade is None:
+                return
+            if last is not None:
+                trade.last_price = last
+            if trade.is_live and mark is not None:
+                trade.mark_price = mark
+                self._track_excursion(trade, mark)
+                if trade.fill_price and trade.qty:
+                    qty = float(trade.qty)
+                    trade.unrealised_pnl = (mark - trade.fill_price) * qty if trade.side == "Buy" \
+                        else (trade.fill_price - mark) * qty
+                # ── Strat1: ratchet the stop ──────────────────
+                if trade.strat1_enabled and trade.strat1_phase < len(self._ratchet):
+                    strat1_snapshot = self._evaluate_strat1(trade, mark)
+            snapshot = trade.clone()
 
-                    # ── Strat1: ratchet the stop ──────────────────
-                    if trade.strat1_enabled and trade.strat1_phase < len(self._ratchet):
-                        strat1_snapshot = self._evaluate_strat1(trade, mark)
-                    break
-
-        if strat1_snapshot:
-            self._on_trade_update(strat1_snapshot)
-        elif snapshot:
-            self._on_trade_update(snapshot)
+        self._on_trade_update(strat1_snapshot or snapshot)
 
     def _evaluate_strat1(self, trade: TradeState, mark: float) -> Optional[TradeState]:
         """
@@ -1460,6 +1454,7 @@ class TradingCore:
             old_key = order_id if order_id in self._trades else order_link_id
             self._rekey_trade(old_key, order_id, trade)
         self._on_trade_update(trade.clone())
+        self._subscribe_ticker(symbol)   # the resting entry shows its distance to the fill
 
         return trade
 

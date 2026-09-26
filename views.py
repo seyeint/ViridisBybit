@@ -273,6 +273,8 @@ class TradeCard(QFrame):
                     right += "&nbsp;&nbsp;" + span(fmt_r(pnl / risk), T.TEXT_DIM, 10)
         else:
             head += f"&nbsp;&nbsp;&nbsp;{dim('resting')} {px(entry)}"
+            if t.last_price:
+                head += f" {dim('· last')} {span(px(t.last_price), T.ACCENT)}"
             ref = (ticker or {}).get("ask1Price" if long else "bid1Price")
             if ref and entry:
                 gap = abs(float(ref) - entry) / entry
@@ -283,7 +285,10 @@ class TradeCard(QFrame):
             f"<td>{head}</td><td align='right'>{right}</td></tr></table>"
         )
 
-        self.mini.set_levels(entry, sl, tp, liq, mark, t.mfe_price if live else None)
+        # Live: the caret is the mark (PnL and liquidation reference). Resting:
+        # a hollow caret at the last traded price, which is what fills the entry.
+        self.mini.set_levels(entry, sl, tp, liq, mark if live else t.last_price,
+                             t.mfe_price if live else None, pending=not live)
 
         # ── Details: unfold on click, tooltip on hover ──
         parts = [f"lev {v((t.leverage or '--') + 'x')}",

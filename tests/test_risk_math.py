@@ -111,6 +111,9 @@ def make_core(client=None):
     core._queue = FakeQueue()
     core._trades = {}
     core._lock = threading.RLock()
+    core._ws_public = None                 # no socket: ticker subscriptions are no-ops
+    core._subscribed_tickers = set()
+    core._last_ticker = {}
     core._risk_ledger_lock = threading.Lock()
     core._risk_ledger = []
     core._save_risk_ledger = lambda: None
@@ -481,6 +484,21 @@ class TestReconciliation(SetFees):
         self.assertEqual(t.close_price, 104.0)
         self.assertAlmostEqual(t.pnl, (104 - 100) * 2 - 100 * 2 * MAKER - 104 * 2 * TAKER, places=6)
         self.assertEqual(core._queue.items[0][0], core._update_risk_intent)
+
+    def test_ticker_prices_a_resting_entry_and_a_live_position(self):
+        core = make_core()
+        emitted = []
+        core._on_trade_update = emitted.append
+        pend = tc.TradeState("ETHUSDT", "Buy", "p")
+        pend.entry_price = 3900.0
+        live = live_trade("BTCUSDT")
+        core._trades.update({"p": pend, live.entry_order_id: live})
+        core._handle_ticker_event({"data": {"symbol": "ETHUSDT", "lastPrice": "3912.5", "markPrice": "3912.0"}})
+        self.assertEqual((pend.last_price, pend.mark_price, pend.unrealised_pnl), (3912.5, None, None))
+        core._handle_ticker_event({"data": {"symbol": "BTCUSDT", "lastPrice": "103", "markPrice": "103.5"}})
+        self.assertEqual((live.last_price, live.mark_price, live.unrealised_pnl), (103.0, 103.5, 7.0))
+        self.assertEqual(live.mfe_price, 103.5)
+        self.assertEqual([t.symbol for t in emitted], ["ETHUSDT", "BTCUSDT"])
 
     def test_order_event_fill_sets_live_since_and_tp_child_closes(self):
         core = make_core()

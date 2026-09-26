@@ -17,7 +17,7 @@ Every exchange ticket asks for a size and a leverage. Neither is something you k
 1. **Fill the ticket.** Symbol, entry, a stop as a price or a distance (`-0.8%`), an optional target as a price, a percent (`+3%`) or a multiple of the stop distance (`2R`), and the risk in dollars or as a share of equity (`1%`). Arrow keys nudge prices by one tick.
 2. **Read the preview.** It recomputes as you type: quantity, leverage, margin, fees, reward-to-risk, the estimated liquidation price and the cushion between it and your stop. Warnings appear ranked: amber ones ask for a confirmation, red ones block.
 3. **Send.** ⌘Enter opens a confirm sheet with the same numbers and warnings. One API call places a limit entry carrying a limit take-profit and a market stop-loss that triggers on mark price. Post-only is on by default: a limit that would cross the book is cancelled instead of filling as taker.
-4. **Manage.** The trade becomes a card: entry, mark, PnL in dollars and R, and a mini ladder with the stop, the target and the liquidation price. Click it and the details unfold, leverage, quantity, cushion, best and worst excursion, with the buttons that matter: stop to break-even, stop to −0.5R, edit target or stop, cancel, close at market. Hover any card for the same numbers.
+4. **Manage.** The trade becomes a card: entry, mark, PnL in dollars and R, and a mini ladder with the stop, the target and the liquidation price. While the entry is still resting, a hollow caret tracks the last traded price against it, so you can see how close the fill is; it turns solid when the trade is on. Click it and the details unfold, leverage, quantity, cushion, best and worst excursion, with the buttons that matter: stop to break-even, stop to −0.5R, edit target or stop, cancel, close at market. Hover any card for the same numbers.
 5. **Review.** When the trade closes, the journal takes Bybit's closed-PnL record, which is fee-inclusive, and attaches the R-multiple plus maximum favourable and adverse excursion. The strip at the bottom shows today, the last seven days and lifetime.
 
 ## The arithmetic, once
@@ -37,7 +37,7 @@ Leverage is a capital-efficiency knob, not a risk knob: the loss at the stop is 
 
 ## What keeps you out of trouble
 
-- **Caps.** Risk above 2% of equity on one trade asks for a hard confirm. Open risk above 6% of equity after the trade asks for a confirm. A daily loss limit, if you set one, blocks new trades for the day. Three losses in a row add a warning.
+- **A fat-finger check.** One trade risking more than 50% of equity asks for a hard confirm; that is the only guard on by default. Optional and off unless you set them: a cap on what you lose if every stop hits, a daily loss limit that blocks new trades, and a loss-streak warning.
 - **Blocks.** Margin above available balance, a second trade on a symbol that already has one, and a breached daily limit disable the send button.
 - **Tier-aware sizing.** Bybit raises the maintenance margin rate as position value grows. On most alts tier 1 ends at $5k–$20k of notional, so the base rate would put liquidation inside the stop. Viridis uses the tier the trade actually lands in.
 - **Strat1.** An optional stop ratchet: at 75% of the way to the target the stop moves to −0.5R, at 90% to fee-adjusted break-even. The table is configurable, the stop never loosens, and it survives restarts.
@@ -74,10 +74,10 @@ Everything lives in `.env`. Defaults are sensible for a VIP0 account; the fee ra
 | `BYBIT_API_KEY`, `BYBIT_API_SECRET` | | Credentials |
 | `BYBIT_TESTNET` | `false` | Use testnet |
 | `DEFAULT_RISK_USD` | `100` | Seeds the risk field |
-| `MAX_RISK_PCT` | `2.0` | Per-trade risk above this share of equity needs a hard confirm |
-| `MAX_OPEN_RISK_PCT` | `6.0` | Open risk above this share of equity needs a confirm |
+| `MAX_RISK_PCT` | `50` | Fat-finger check: one trade risking more than this share of equity needs a hard confirm; 0 turns it off |
+| `MAX_OPEN_RISK_PCT` | `0` | Cap on what you lose if every stop hits, % of equity; 0 turns it off |
 | `DAILY_LOSS_LIMIT_USD` | `0` | Realised loss today at which sending is disabled; 0 turns it off |
-| `LOSS_STREAK_CONFIRM` | `3` | Consecutive losses at which a new trade warns; 0 turns it off |
+| `LOSS_STREAK_CONFIRM` | `0` | Consecutive losses at which a new trade warns; 0 turns it off |
 | `STRAT1_RATCHET` | `0.75:-0.5,0.90:0` | Strat1 steps as `progress:lockR` pairs |
 | `LIQ_CUSHION_PCT` | `0.2` | Room between the stop and the liquidation price, % of entry; widen it on thin alts, it only costs margin |
 | `SL_TRIGGER_BY` | `MarkPrice` | Stop trigger reference; liquidation uses mark, so keep it |

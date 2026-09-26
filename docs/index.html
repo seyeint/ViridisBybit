@@ -289,10 +289,10 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
     <tr><td><code>SL_TRIGGER_BY</code></td><td><code>MarkPrice</code></td><td>Stop trigger reference (<code>MarkPrice</code> or <code>LastPrice</code>).</td></tr>
     <tr><td><code>JOURNAL_BACKFILL_DAYS</code></td><td><code>30</code></td><td>Cold-start history backfill window.</td></tr>
     <tr><td><code>RISK_LEDGER_MAX_AGE_DAYS</code></td><td><code>365</code></td><td>Ledger entries older than this are pruned. Keep it above your longest hold, or a restart loses Strat1 and R on that trade.</td></tr>
-    <tr><td><code>MAX_RISK_PCT</code></td><td><code>2.0</code></td><td>Risk on one trade above this share of equity asks for a hard confirm.</td></tr>
-    <tr><td><code>MAX_OPEN_RISK_PCT</code></td><td><code>6.0</code></td><td>Open risk (sum of $ at the stops) above this share of equity asks for a confirm.</td></tr>
-    <tr><td><code>DAILY_LOSS_LIMIT_USD</code></td><td><code>0</code></td><td>Realised loss today at which no new trades are accepted. 0 = off.</td></tr>
-    <tr><td><code>LOSS_STREAK_CONFIRM</code></td><td><code>3</code></td><td>Consecutive losses at which a new trade asks for a confirm. 0 = off.</td></tr>
+    <tr><td><code>MAX_RISK_PCT</code></td><td><code>50</code></td><td>Fat-finger check: one trade risking more than this share of equity asks for a hard confirm. 0 = off.</td></tr>
+    <tr><td><code>MAX_OPEN_RISK_PCT</code></td><td><code>0</code></td><td>Optional cap on what you lose if every active stop hits, as a share of equity. 0 = off.</td></tr>
+    <tr><td><code>DAILY_LOSS_LIMIT_USD</code></td><td><code>0</code></td><td>Optional: realised loss today at which no new trades are accepted. 0 = off.</td></tr>
+    <tr><td><code>LOSS_STREAK_CONFIRM</code></td><td><code>0</code></td><td>Optional: consecutive losses at which a new trade warns. 0 = off.</td></tr>
     <tr><td><code>STRAT1_RATCHET</code></td><td><code>0.75:-0.5,0.90:0</code></td><td>Strat1 table: at ≥ progress to TP, lock that many R (see §07).</td></tr>
   </table>
   <h3>On-disk state (git-ignored)</h3>
@@ -329,11 +329,18 @@ liq ≈ 74300 × (1 − 1/48 + 0.005) = 73,124  <span class="c">→ 0.23% behind
   core's own trade object, so the next ticker snapshot carries the change instead of reverting it. A stop
   that would trigger immediately is refused before it is sent.</p>
   <h3>Governance strip</h3>
-  <p>Open risk (sum of dollars at the stops across active trades, derived from the bracket for positions the
-  app did not place), today's realised PnL against the daily limit, and the loss streak. The caps are
-  <code>.env</code> settings; a breached daily limit disables execute until tomorrow. This is what replaced
-  the exposure heat bar: notional over equity says nothing under leverage-derived sizing, dollars at the
-  stops do.</p>
+  <p>Three numbers: what you lose if every active stop hits (the sum of the dollars at the stops, derived
+  from the bracket for positions the app did not place — nothing to do with liquidation), today's realised
+  PnL, and the loss streak. Only one guard is on by default: a single trade risking more than 50% of equity
+  is treated as a fat-finger and asks for a hard confirm. The others — a cap on the total at the stops, a
+  daily loss limit that disables execute until tomorrow, a streak warning — are <code>.env</code> keys and
+  off until set. The strip replaced the exposure heat bar: notional over equity says nothing under
+  leverage-derived sizing, dollars at the stops do.</p>
+  <h3>Resting entries</h3>
+  <p>A card whose entry has not filled shows a hollow caret at the last traded price on its mini ladder, and
+  the distance from the entry to the best ask (or bid, for a short) in the header. Last price is the right
+  reference here — a resting limit fills when the traded market reaches it, not when mark does. The caret
+  turns solid, and moves to mark, the moment the fill arrives.</p>
 
   <p class="foot">Viridis · personal proprietary execution engine. This guide reflects the engine as of the
   board rewrite (live preview, ladder, cards, governance strip), tier-aware MMR with the liquidation check,

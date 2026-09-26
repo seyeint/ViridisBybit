@@ -70,15 +70,16 @@ RISK_LEDGER_FILE: str = os.path.join(
 RISK_LEDGER_MAX_AGE_DAYS: int = int(os.getenv("RISK_LEDGER_MAX_AGE_DAYS", "365"))
 
 # ─── Risk governance (account level) ─────────────────────────────
-# Risk on one trade above this share of equity asks for a hard confirm.
-MAX_RISK_PCT: float = float(os.getenv("MAX_RISK_PCT", "2.0"))
-# Open risk (sum of $ at the stops across active trades) above this share of
-# equity asks for a confirm before adding another trade.
-MAX_OPEN_RISK_PCT: float = float(os.getenv("MAX_OPEN_RISK_PCT", "6.0"))
-# Realised loss today at which the terminal stops taking new trades. 0 = off.
+# The only guard on by default is a fat-finger check: a single trade risking
+# more than this share of equity asks for a hard confirm. 0 = off.
+MAX_RISK_PCT: float = float(os.getenv("MAX_RISK_PCT", "50"))
+# Optional cap on what you lose if every active stop hits (this trade
+# included), as a share of equity. Off by default.
+MAX_OPEN_RISK_PCT: float = float(os.getenv("MAX_OPEN_RISK_PCT", "0"))
+# Optional: realised loss today at which no new trades are accepted. 0 = off.
 DAILY_LOSS_LIMIT_USD: float = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))
-# Consecutive losses at which a new trade asks for a confirm. 0 = off.
-LOSS_STREAK_CONFIRM: int = int(os.getenv("LOSS_STREAK_CONFIRM", "3"))
+# Optional: consecutive losses at which a new trade warns. 0 = off.
+LOSS_STREAK_CONFIRM: int = int(os.getenv("LOSS_STREAK_CONFIRM", "0"))
 
 # ─── Strat1 ratchet ───────────────────────────────────────────────
 # "progress:lockR, …" — at ≥ progress of the entry→TP journey, move the stop

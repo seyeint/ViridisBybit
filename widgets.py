@@ -221,11 +221,15 @@ class MiniLadder(QWidget):
         super().__init__(parent)
         self.setFixedHeight(30)
         self._levels: dict = {}
+        self._pending = False
 
     def set_levels(self, entry: Optional[float], sl: Optional[float], tp: Optional[float],
                    liq: Optional[float] = None, mark: Optional[float] = None,
-                   mfe: Optional[float] = None) -> None:
+                   mfe: Optional[float] = None, pending: bool = False) -> None:
+        """`mark` is the caret. For a resting entry pass the last traded price and
+        pending=True: the caret is drawn hollow until the fill turns it solid."""
         self._levels = {"entry": entry, "sl": sl, "tp": tp, "liq": liq, "mark": mark, "mfe": mfe}
+        self._pending = pending
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -276,8 +280,12 @@ class MiniLadder(QWidget):
             p.drawEllipse(QPointF(x(L["mfe"]), 5), 2.5, 2.5)
         if L.get("mark"):
             xx = x(L["mark"])
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(_c(T.ACCENT))
+            if self._pending:
+                p.setPen(QPen(_c(T.ACCENT), 1.2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+            else:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(_c(T.ACCENT))
             p.drawPolygon(QPolygonF([QPointF(xx - 4, 3), QPointF(xx + 4, 3), QPointF(xx, 10)]))
 
 

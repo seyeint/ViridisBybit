@@ -207,10 +207,11 @@ class MainWindow(QMainWindow):
         gl.setContentsMargins(0, 0, 0, 0)
         gl.setSpacing(0)
         self.gov_cells = {}
-        cap_open = f"{config.MAX_OPEN_RISK_PCT:g}%"
+        open_k = "if every stop hits" + (f" · cap {config.MAX_OPEN_RISK_PCT:g}%"
+                                          if config.MAX_OPEN_RISK_PCT > 0 else "")
         day_k = (f"today · limit −${config.DAILY_LOSS_LIMIT_USD:,.0f}"
                  if config.DAILY_LOSS_LIMIT_USD > 0 else "today")
-        for name, k in (("open", f"open risk · cap {cap_open}"), ("day", day_k), ("streak", "streak")):
+        for name, k in (("open", open_k), ("day", day_k), ("streak", "streak")):
             cell = QWidget()
             cl = QVBoxLayout(cell)
             cl.setContentsMargins(12, 5, 12, 5)
@@ -982,12 +983,12 @@ class MainWindow(QMainWindow):
         if tp is not None and ((long and tp <= entry) or (not long and tp >= entry)):
             warns.append(("hard", "target is on the loss side of entry", False))
         if eq and config.MAX_RISK_PCT > 0 and risk > eq * config.MAX_RISK_PCT / 100:
-            warns.append(("hard", f"risk {risk / eq * 100:.1f}% of equity is above the "
-                                  f"{config.MAX_RISK_PCT:g}% per-trade cap", False))
+            warns.append(("hard", f"risk is {risk / eq * 100:.0f}% of equity · above the "
+                                  f"{config.MAX_RISK_PCT:g}% fat-finger check", False))
         open_after = self._gov["open_risk"] + risk
         if eq and config.MAX_OPEN_RISK_PCT > 0 and open_after > eq * config.MAX_OPEN_RISK_PCT / 100:
-            warns.append(("warn", f"open risk would be {fmt_usd(open_after, 0, signed=False)} · "
-                                  f"{open_after / eq * 100:.1f}% of equity, above the "
+            warns.append(("warn", f"if every stop hits you lose {fmt_usd(open_after, 0, signed=False)} · "
+                                  f"{open_after / eq * 100:.0f}% of equity, above the "
                                   f"{config.MAX_OPEN_RISK_PCT:g}% cap", False))
         limit = config.DAILY_LOSS_LIMIT_USD
         if limit > 0:
@@ -999,7 +1000,7 @@ class MainWindow(QMainWindow):
                 warns.append(("warn", f"a stop here would breach today's −${limit:,.0f} limit "
                                       f"(now {fmt_usd(today)})", False))
         if config.LOSS_STREAK_CONFIRM > 0 and self._gov["streak"] >= config.LOSS_STREAK_CONFIRM:
-            warns.append(("warn", f"{self._gov['streak']} losses in a row · take a breath", False))
+            warns.append(("warn", f"{self._gov['streak']} losses in a row", False))
         if calc["tier"] > 1:
             warns.append(("warn", f"notional {fmt_usd(calc['notional_usd'], 0, signed=False)} passes the "
                                   f"tier-1 cap · sized with tier {calc['tier']} mmr {calc['mmr_pct']:.2f}%, "
@@ -1133,7 +1134,7 @@ class MainWindow(QMainWindow):
             f"{'target ' + fmt_px(tp, tick) + ' limit' if tp else 'no target'}\n"
             f"risk {fmt_usd(risk, 2, signed=False)}"
             + (f"  ·  {risk / eq * 100:.1f}% of equity" if eq else "")
-            + f"  ·  open after {fmt_usd(self._gov['open_risk'] + risk, 0, signed=False)}"
+            + f"  ·  {fmt_usd(self._gov['open_risk'] + risk, 0, signed=False)} if every stop hits"
         )
         hard = [t for lvl, t, _ in self._warnings if lvl == "hard"]
         soft = [t for lvl, t, _ in self._warnings if lvl == "warn"]
@@ -1388,8 +1389,9 @@ class MainWindow(QMainWindow):
         unk = f" · {unknown} unsized" if unknown else ""
         vl.setText(f"{span(fmt_usd(open_risk, 0, signed=False), T.WHITE, weight=600)}"
                    f"{span(pct_s + f' · {len(active)} trade' + ('s' if len(active) != 1 else '') + unk, T.TEXT_DIM)}")
-        frac = open_risk / (eq * config.MAX_OPEN_RISK_PCT / 100) if eq and config.MAX_OPEN_RISK_PCT > 0 else 0
-        meter.set_fraction(frac, None if eq else "off")
+        capped = bool(eq) and config.MAX_OPEN_RISK_PCT > 0
+        meter.set_fraction(open_risk / (eq * config.MAX_OPEN_RISK_PCT / 100) if capped else 0,
+                           None if capped else "off")
 
         vl, meter = self.gov_cells["day"]
         col = T.NEGATIVE if today["total_pnl"] < 0 else T.POSITIVE
