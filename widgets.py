@@ -218,7 +218,8 @@ class MiniLadder(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(30)
+        # 38px: a 10px label row above the track, the track, a 10px label row below.
+        self.setFixedHeight(38)
         self._levels: dict = {}
         self._pending = False
 
@@ -245,7 +246,7 @@ class MiniLadder(QWidget):
         def x(v: float) -> float:
             return 8 + (v - lo) / span * (w - 16)
 
-        ty = 15.0
+        ty = 18.0
         p.setPen(QPen(_c(T.BORDER), 2))
         p.drawLine(QPointF(4, ty), QPointF(w - 4, ty))
         for a, b, col in (("entry", "tp", _c(T.POSITIVE, 150)),
@@ -267,11 +268,11 @@ class MiniLadder(QWidget):
             colq = _c(col, 170 if key == "liq" else 255)
             p.setPen(QPen(colq, 1))
             if above:
-                p.drawLine(QPointF(xx, ty - 3), QPointF(xx, ty - 9))
-                p.drawText(QRectF(xx - 20, 0, 40, 8), _CENTER, label)
+                p.drawLine(QPointF(xx, ty - 3), QPointF(xx, ty - 8))
+                p.drawText(QRectF(xx - 20, 0, 40, 10), _CENTER, label)
             else:
                 p.drawLine(QPointF(xx, ty + 3), QPointF(xx, ty + 8))
-                p.drawText(QRectF(xx - 24, ty + 9, 48, 9), _CENTER, label)
+                p.drawText(QRectF(xx - 24, ty + 9, 48, 10), _CENTER, label)
 
         if L.get("mark"):
             xx = x(L["mark"])
@@ -281,7 +282,7 @@ class MiniLadder(QWidget):
             else:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(_c(T.ACCENT))
-            p.drawPolygon(QPolygonF([QPointF(xx - 4, 3), QPointF(xx + 4, 3), QPointF(xx, 10)]))
+            p.drawPolygon(QPolygonF([QPointF(xx - 4, 6), QPointF(xx + 4, 6), QPointF(xx, 13)]))
 
 
 # ──────────────────────────────────────────────────────────────────
